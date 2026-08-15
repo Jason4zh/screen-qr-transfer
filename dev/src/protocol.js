@@ -123,20 +123,23 @@
     return JSON.parse(new TextDecoder().decode(payload.subarray(0, end)));
   }
 
-  /* 发送端布局参数：由屏幕尺寸 + 目标版本上限计算
-   * 整数模块像素 px（模块均匀、jsQR 解码稳定）+ 版本 + 绘制尺寸 + 分包大小 */
-  function computeLayoutParams(W, H, maxVersion) {
+  /* 发送端布局参数：由屏幕尺寸 + 目标模块像素 + 版本上限计算
+   * 整数模块像素 px（模块均匀、jsQR 解码稳定）+ 版本 + 绘制尺寸 + 分包大小。
+   * px 目标值（标准 4 / 高速 3）会随屏幕过小而自动下调。 */
+  function computeLayoutParams(W, H, maxVersion, targetPx) {
     var m = Math.max(18, Math.round(Math.min(W, H) * 0.02));
     var whiteW = W - 2 * m, whiteH = H - 2 * m;
-    var px = 4, ver = 0;
-    for (px = 4; px >= 2; px--) {
-      var maxTotal = Math.floor(Math.min(whiteW / (3.4 * px), whiteH / (2.4 * px)));
+    var px = targetPx || 4, ver = 0;
+    for (px = (targetPx || 4); px >= 2; px--) {
+      var maxTotal = Math.floor(Math.min(whiteW / ((GRID_COLS + (GRID_COLS - 1) * GAP_RATIO) * px),
+        whiteH / ((GRID_ROWS + (GRID_ROWS - 1) * GAP_RATIO) * px)));
       ver = Math.floor((maxTotal - 25) / 4);
       if (ver >= 1) break;
     }
     ver = Math.max(1, Math.min(ver, maxVersion));
     var total = ver * 4 + 17 + 8;
-    px = Math.max(2, Math.floor(Math.min(whiteW / (3.4 * total), whiteH / (2.4 * total))));
+    px = Math.max(2, Math.floor(Math.min(whiteW / ((GRID_COLS + (GRID_COLS - 1) * GAP_RATIO) * total),
+      whiteH / ((GRID_ROWS + (GRID_ROWS - 1) * GAP_RATIO) * total))));
     var qrDrawn = px * total;
     var chunkSize = Math.max(64, CAPACITY_L[ver] - HEADER_LEN - 4);
     return { px: px, version: ver, total: total, qrDrawn: qrDrawn, chunkSize: chunkSize };
@@ -177,10 +180,11 @@
   /* ---------- 屏幕网格几何（发送端与接收端共用同一套公式） ----------
    * 布局：彩色边框(m) → 白色区域 → 3×2 二维码阵列。
    * qrDrawn 为各码实际绘制边长（= 整数模块像素 × 总模块数，保证模块均匀、
-   * jsQR 解码稳定）；间距 gap = 20% × qrDrawn（保证 jsQR 多码检测）。
+   * jsQR 解码稳定）；间距 gap = 12% × qrDrawn（jsQR 多码补丁后在
+   * 0.10~0.12 间距下种子搜索仍 6/6，更小间距显著提升单帧容量）。
    * 所有包（含元数据）补齐为相同负载 → 全屏同一版本 → 尺寸统一可推导。 */
   var GRID_COLS = 3, GRID_ROWS = 2;
-  var GAP_RATIO = 0.2;
+  var GAP_RATIO = 0.12;
 
   function gridLayout(W, H, qrDrawn) {
     var m = Math.max(18, Math.round(Math.min(W, H) * 0.02));

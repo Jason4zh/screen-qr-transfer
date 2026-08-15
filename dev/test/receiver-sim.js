@@ -84,12 +84,15 @@ function warp(src, sw, sh, dstW, dstH, corners) {
 }
 
 function crop(img, x, y, w, h) {
-  const d = new Uint8ClampedArray(w * h * 4);
-  for (let yy = 0; yy < h; yy++) for (let xx = 0; xx < w; xx++) {
-    const so = ((y + yy) * img.width + (x + xx)) * 4, do_ = (yy * w + xx) * 4;
+  const cx = Math.max(0, Math.round(x)), cy = Math.max(0, Math.round(y));
+  const cw = Math.min(w, img.width - cx), ch = Math.min(h, img.height - cy);
+  if (cw < 40 || ch < 40) return null;
+  const d = new Uint8ClampedArray(cw * ch * 4);
+  for (let yy = 0; yy < ch; yy++) for (let xx = 0; xx < cw; xx++) {
+    const so = ((cy + yy) * img.width + (cx + xx)) * 4, do_ = (yy * cw + xx) * 4;
     d[do_] = img.data[so]; d[do_ + 1] = img.data[so + 1]; d[do_ + 2] = img.data[so + 2]; d[do_ + 3] = 255;
   }
-  return { data: d, width: w, height: h };
+  return { data: d, width: cw, height: ch };
 }
 
 function addNoise(img, pct) {
@@ -110,8 +113,6 @@ function median(arr) {
 /* 接收端定位（与 receiver.js 同算法）：返回区域列表 */
 function locate(img, handlePkt) {
   const W = img.width, H = img.height;
-  const seed = jsQR(img.data, W, H);
-  if (!seed) return [];
   const corr = [], sizes = [];
   function addCorr(qr, ox, oy) {
     const pkt = Proto.decodePacket(qr.binaryData);
@@ -121,34 +122,67 @@ function locate(img, handlePkt) {
     sizes.push(dg.qrSize);
     if (handlePkt) handlePkt(pkt);
   }
-  addCorr(seed, 0, 0);
-  const g = Proto.deriveGrid(seed);
-  const half = g.qrSize / 2 + 4;
-  const side = Math.round(g.qrSize + 8);
-  for (const [dx, dy] of Proto.candidateOffsets()) {
-    const cx = g.centerX + dx * g.pitch, cy = g.centerY + dy * g.pitch;
-    if (cx - half < 0 || cy - half < 0 || cx + half > W || cy + half > H) continue;
-    const rx = Math.round(cx - half), ry = Math.round(cy - half);
-    const t = crop(img, rx, ry, side, side);
-    const r = jsQR(t.data, t.width, t.height);
-    if (r && r.binaryData) addCorr(r, rx, ry);
+  let g = null;
+  /* 阶段 A：整帧种子 + 均匀网格候选扫描（宽容裁剪） */
+  const seed = jsQR(img.data, W, H);
+  if (seed) {
+    addCorr(seed, 0, 0);
+    g = Proto.deriveGrid(seed);
+    const side = Math.round(g.qrSize * 1.3);
+    const half = side / 2;
+    for (const [dx, dy] of Proto.candidateOffsets()) {
+      const cx = g.centerX + dx * g.pitch, cy = g.centerY + dy * g.pitch;
+      if (cx - half < 0 || cy - half < 0 || cx + half > W || cy + half > H) continue;
+      const rx = Math.round(cx - half), ry = Math.round(cy - half);
+      const t = crop(img, rx, ry, side, side);
+      if (!t) continue;
+      const r = jsQR(t.data, t.width, t.height);
+      if (r && r.binaryData) addCorr(r, rx, ry);
+    }
   }
-  const medSize = median(sizes) || g.qrSize;
+  /* 阶段 B（兜底）：半帧大瓦片扫描（≥ 单码尺寸，保证整码落入） */
+  if (corr.length < 3) {
+    const tw = Math.floor(W / 2), th = Math.floor(H / 2);
+    const xstep = Math.floor(tw / 2), ystep = Math.floor(th / 2);
+    const nx = Math.ceil((W - tw) / xstep) + 1, ny = Math.ceil((H - th) / ystep) + 1;
+    for (let r = 0; r < ny; r++) for (let c = 0; c < nx; c++) {
+      const x = Math.min(W - tw, Math.round(c * xstep));
+      const y = Math.min(H - th, Math.round(r * ystep));
+      const t = crop(img, x, y, tw, th);
+      if (!t) continue;
+      const qr = jsQR(t.data, t.width, t.height);
+      if (qr && qr.binaryData) {
+        const pkt = Proto.decodePacket(qr.binaryData);
+        if (pkt) {
+          const dg = Proto.deriveGrid(qr);
+          corr.push({ cell: pkt.cell, x: dg.centerX + x, y: dg.centerY + y, size: dg.qrSize });
+          sizes.push(dg.qrSize);
+        }
+      }
+    }
+  }
+  if (!corr.length) return [];
+  /* 阶段 C：仿射拟合 + 逐格验证 */
+  const medSize = median(sizes) || (g ? g.qrSize : 320);
   const T = corr.length >= 3 ? Proto.fitAffine(corr) : null;
   const found = [];
   if (T) {
-    const cside = Math.round(medSize + 8);
-    const chalf = medSize / 2 + 4;
+    /* 验证裁剪：比码略大（容纳透视残差）但小于码距（避免含入邻码） */
+    const cside = Math.round(medSize * 1.06);
     for (let cellId = 0; cellId < 6; cellId++) {
       const pos = T.apply(cellId);
-      if (pos.x - chalf < 0 || pos.y - chalf < 0 || pos.x + chalf > W || pos.y + chalf > H) continue;
+      const chalf = cside / 2;
+      if (pos.x + cside < 0 || pos.y + cside < 0 || pos.x - cside > W || pos.y - cside > H) continue;
       const rx = Math.round(pos.x - chalf), ry = Math.round(pos.y - chalf);
       const t2 = crop(img, rx, ry, cside, cside);
+      if (!t2) continue;
       const r2 = jsQR(t2.data, t2.width, t2.height);
       if (r2 && r2.binaryData) {
         const pkt2 = Proto.decodePacket(r2.binaryData);
         if (pkt2 && pkt2.cell === cellId) {
-          found.push({ cell: cellId, x: rx, y: ry, w: cside, h: cside });
+          const dg2 = Proto.deriveGrid(r2);
+          const rs = Math.round(dg2.qrSize + 8);
+          found.push({ cell: cellId, x: Math.round(dg2.centerX + rx - rs / 2), y: Math.round(dg2.centerY + ry - rs / 2), w: rs, h: rs });
           if (handlePkt) handlePkt(pkt2);
         }
       }
@@ -168,7 +202,7 @@ function locate(img, handlePkt) {
 /* 传输会话：布局与分块统一由 computeLayoutParams 决定（与 sender.js 一致） */
 function session(fileBytes, opts) {
   const W = 1280, H = 853;
-  const P = Proto.computeLayoutParams(W, H, opts.maxVersion || 17);
+  const P = Proto.computeLayoutParams(W, H, opts.maxVersion || 29, opts.px || 4);
   const L = Proto.gridLayout(W, H, P.qrDrawn);
   const px = P.px;
   const chunkSize = P.chunkSize;
@@ -195,10 +229,10 @@ function session(fileBytes, opts) {
 
   const maxFrames = opts.maxFrames || 300;
   for (frames = 0; frames < maxFrames && (got < meta.chunks || !metaSeen); frames++) {
-    /* 槽位（与 sender.js 一致）：槽位 0 固定元数据；队列耗尽重建；
-     * 小文件剩余槽位填元数据 */
+    /* 槽位（与 sender.js 一致）：0 号码位每 8 帧显示元数据（其余传数据）；
+     * 队列耗尽重建；小文件剩余槽位填元数据 */
     const slots = new Array(6).fill(null);
-    slots[0] = 0;
+    if (frames % 8 === 0) slots[0] = 0;
     for (let i = 0; i < 6; i++) {
       if (slots[i] !== null) continue;
       if (order.length === 0 || pos >= meta.chunks) reshuffle();
@@ -217,6 +251,7 @@ function session(fileBytes, opts) {
     }
     for (const rg of regions) {
       const t = crop(img, rg.x, rg.y, rg.w, rg.h);
+      if (!t) continue;
       const qr = jsQR(t.data, t.width, t.height);
       if (!qr) continue;
       const pkt = Proto.decodePacket(qr.binaryData);
@@ -276,6 +311,63 @@ console.log('\n== 场景 4：数据包头 total 支撑元数据前的进度估�
   const { packets } = Proto.packetize(fileBytes, 'p.bin', 404);
   const d = Proto.decodePacket(packets[1]);
   ok(d && d.total === Math.ceil(5000 / 404), `数据包头携带 total=${d.total}，元数据前即可估算进度`);
+}
+
+console.log('\n== 场景 5：高速档（1920×1080，px=3，v33） ==');
+{
+  const fileBytes = new Uint8Array(300000);
+  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 61 + 11) & 255;
+  /* 1920×1080 帧（与真实全屏一致） */
+  const P = Proto.computeLayoutParams(1920, 1080, 33, 3);
+  const L = Proto.gridLayout(1920, 1080, P.qrDrawn);
+  console.log(`  布局: px=${P.px} v${P.version} qrDrawn=${P.qrDrawn} chunk=${P.chunkSize}（单帧 ≈${(P.chunkSize * 6 / 1024).toFixed(1)}KB）`);
+  const { packets, meta } = Proto.packetize(fileBytes, 'fast.bin', P.chunkSize);
+  const order = [];
+  for (let i = 1; i <= meta.chunks; i++) order.push(i);
+  let pos = 0;
+  function reshuffle() {
+    for (let j = order.length - 1; j > 0; j--) { const k = (Math.random() * (j + 1)) | 0; const t = order[j]; order[j] = order[k]; order[k] = t; }
+    pos = 0;
+  }
+  const chunks = new Array(meta.chunks);
+  const received = new Uint8Array(meta.chunks + 1);
+  let got = 0, metaSeen = false, regions = [];
+  const handlePkt = (pkt) => {
+    if (pkt.isMeta) { metaSeen = true; return; }
+    if (pkt.index >= 1 && pkt.index <= meta.chunks && !received[pkt.index]) {
+      received[pkt.index] = 1; got++;
+      chunks[pkt.index - 1] = pkt.payload;
+    }
+  };
+  const t0 = Date.now();
+  let frames = 0;
+  for (frames = 0; frames < 200 && (got < meta.chunks || !metaSeen); frames++) {
+    const slots = new Array(6).fill(null);
+    if (frames % 8 === 0) slots[0] = 0;
+    for (let i = 0; i < 6; i++) {
+      if (slots[i] !== null) continue;
+      if (order.length === 0 || pos >= meta.chunks) reshuffle();
+      if (pos < meta.chunks) { slots[i] = order[pos++]; } else { slots[i] = 0; }
+    }
+    const payloads = slots.map((ix, cell) => patchCell(packets[ix], cell));
+    const img = renderFrame(payloads, 1920, 1080, frames % 4, L, P.px);
+    if (frames % 10 === 0) regions = locate(img, handlePkt);
+    for (const rg of regions) {
+      const t = crop(img, rg.x, rg.y, rg.w, rg.h);
+      if (!t) continue;
+      const qr = jsQR(t.data, t.width, t.height);
+      if (!qr) continue;
+      const pkt = Proto.decodePacket(qr.binaryData);
+      if (!pkt) continue;
+      handlePkt(pkt);
+    }
+  }
+  const elapsed = (Date.now() - t0) / 1000;
+  const assembled = Proto.assemble(meta, chunks);
+  ok(got === meta.chunks && assembled && Proto.crc32(assembled) === meta.crc32 &&
+     Buffer.compare(Buffer.from(assembled), Buffer.from(fileBytes)) === 0,
+     `高速档 ${frames} 帧收齐 ${meta.chunks} 包，CRC 一致（仿真 ${(fileBytes.length / 1024 / Math.max(0.001, elapsed)).toFixed(0)} KB/s）`);
+  ok(metaSeen, '高速档元数据已收到');
 }
 
 console.log(`\n结果：${passed} 通过, ${failed} 失败`);

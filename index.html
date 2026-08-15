@@ -125,9 +125,9 @@ footer{margin-top:22px;text-align:center;color:#5c6485;font-size:12px;line-heigh
       <div class="row">
         <label class="opt">速度档位
           <select id="speedSel">
-            <option value="stable">稳定（小码 · 慢）</option>
-            <option value="balanced" selected>标准（中码）</option>
-            <option value="fast">高速（大码 · 快）</option>
+            <option value="stable">稳定（大模块 · 慢）</option>
+            <option value="balanced" selected>标准（推荐）</option>
+            <option value="fast">高速（小模块 · 极限）</option>
           </select>
         </label>
       </div>
@@ -175,7 +175,7 @@ footer{margin-top:22px;text-align:center;color:#5c6485;font-size:12px;line-heigh
       <li><b>发送端（电脑）</b>：打开本页 → 选择文件 → 选速度档位 → 「开始发送」。屏幕全屏显示 3×2 的二维码阵列，边框颜色逐帧变化。</li>
       <li><b>接收端（手机）</b>：手机浏览器打开<b>同一页面</b>（把本文件发给手机后用浏览器打开；或电脑运行「启动局域网服务.bat」，手机访问显示的网址）→ 切到「接收端」→ 开启摄像头 → 对准电脑屏幕，等进度到 100% 后保存文件。</li>
       <li><b>对准技巧</b>：手机距屏幕 30~60cm，保持稳定，避免反光与强背光；屏幕亮度适中。绿色框=该码位正常解码，黄色=偶发失败，红色=连续失败（会自动重新定位）。</li>
-      <li><b>速度参考</b>：稳定 ≈3~6 KB/s、标准 ≈8~15 KB/s、高速 ≈15~25 KB/s（视设备与光线），约为传统「单码+黑白」方案的 5~10 倍。</li>
+      <li><b>速度参考</b>（视设备与光线，1080p 屏）：标准 ≈15~25 KB/s、高速 ≈30~50 KB/s，约为传统「单码+黑白」方案的 10~30 倍。模块越小越快但对准要求越高，卡顿时请用标准/稳定档。</li>
       <li><b>为什么不用「逐模块彩色二维码」？</b>手机摄像头对颜色的白平衡与增益不稳定，逐模块彩色编码在真实拍摄下极易误判。本工具改为多维但可靠的方式：<b>空间维度</b>——单帧并行 6 个二维码，承载量约为单码的 6 倍；<b>时间维度</b>——流式换帧，每包独立 CRC 校验 + 乱序洗牌重发，漏帧漏码不丢数据；<b>颜色维度</b>——边框颜色仅作帧变化标识，不承载数据，因此解码稳定。</li>
       <li>文件较大时传输耗时较长，建议先压缩。本工具全程离线运行，不经过任何服务器。</li>
     </ol>
@@ -12735,20 +12735,23 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     return JSON.parse(new TextDecoder().decode(payload.subarray(0, end)));
   }
 
-  /* 发送端布局参数：由屏幕尺寸 + 目标版本上限计算
-   * 整数模块像素 px（模块均匀、jsQR 解码稳定）+ 版本 + 绘制尺寸 + 分包大小 */
-  function computeLayoutParams(W, H, maxVersion) {
+  /* 发送端布局参数：由屏幕尺寸 + 目标模块像素 + 版本上限计算
+   * 整数模块像素 px（模块均匀、jsQR 解码稳定）+ 版本 + 绘制尺寸 + 分包大小。
+   * px 目标值（标准 4 / 高速 3）会随屏幕过小而自动下调。 */
+  function computeLayoutParams(W, H, maxVersion, targetPx) {
     var m = Math.max(18, Math.round(Math.min(W, H) * 0.02));
     var whiteW = W - 2 * m, whiteH = H - 2 * m;
-    var px = 4, ver = 0;
-    for (px = 4; px >= 2; px--) {
-      var maxTotal = Math.floor(Math.min(whiteW / (3.4 * px), whiteH / (2.4 * px)));
+    var px = targetPx || 4, ver = 0;
+    for (px = (targetPx || 4); px >= 2; px--) {
+      var maxTotal = Math.floor(Math.min(whiteW / ((GRID_COLS + (GRID_COLS - 1) * GAP_RATIO) * px),
+        whiteH / ((GRID_ROWS + (GRID_ROWS - 1) * GAP_RATIO) * px)));
       ver = Math.floor((maxTotal - 25) / 4);
       if (ver >= 1) break;
     }
     ver = Math.max(1, Math.min(ver, maxVersion));
     var total = ver * 4 + 17 + 8;
-    px = Math.max(2, Math.floor(Math.min(whiteW / (3.4 * total), whiteH / (2.4 * total))));
+    px = Math.max(2, Math.floor(Math.min(whiteW / ((GRID_COLS + (GRID_COLS - 1) * GAP_RATIO) * total),
+      whiteH / ((GRID_ROWS + (GRID_ROWS - 1) * GAP_RATIO) * total))));
     var qrDrawn = px * total;
     var chunkSize = Math.max(64, CAPACITY_L[ver] - HEADER_LEN - 4);
     return { px: px, version: ver, total: total, qrDrawn: qrDrawn, chunkSize: chunkSize };
@@ -12789,10 +12792,11 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   /* ---------- 屏幕网格几何（发送端与接收端共用同一套公式） ----------
    * 布局：彩色边框(m) → 白色区域 → 3×2 二维码阵列。
    * qrDrawn 为各码实际绘制边长（= 整数模块像素 × 总模块数，保证模块均匀、
-   * jsQR 解码稳定）；间距 gap = 20% × qrDrawn（保证 jsQR 多码检测）。
+   * jsQR 解码稳定）；间距 gap = 12% × qrDrawn（jsQR 多码补丁后在
+   * 0.10~0.12 间距下种子搜索仍 6/6，更小间距显著提升单帧容量）。
    * 所有包（含元数据）补齐为相同负载 → 全屏同一版本 → 尺寸统一可推导。 */
   var GRID_COLS = 3, GRID_ROWS = 2;
-  var GAP_RATIO = 0.2;
+  var GAP_RATIO = 0.12;
 
   function gridLayout(W, H, qrDrawn) {
     var m = Math.max(18, Math.round(Math.min(W, H) * 0.02));
@@ -12920,10 +12924,11 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   var Sender = {};
 
   var PALETTE = ['#E53935', '#43A047', '#1E88E5', '#FDD835'];
+  /* 档位：模块像素 px（4=稳 / 3=快），版本上限随屏幕自适应，帧间隔 holdMs */
   var PRESETS = {
-    stable:   { maxVersion: 13, holdMs: 450 },
-    balanced: { maxVersion: 17, holdMs: 250 },
-    fast:     { maxVersion: 20, holdMs: 150 }
+    stable:   { px: 4, maxVersion: 17, holdMs: 400 },
+    balanced: { px: 4, maxVersion: 29, holdMs: 200 },
+    fast:     { px: 3, maxVersion: 33, holdMs: 150 }
   };
 
   var fileBytes = null, fileName = '';
@@ -12942,14 +12947,14 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     var p = PRESETS[presetName] || PRESETS.balanced;
     cfg = {
       cols: QRProtocol.GRID_COLS, rows: QRProtocol.GRID_ROWS,
-      maxVersion: p.maxVersion, holdMs: p.holdMs,
+      px: p.px, maxVersion: p.maxVersion, holdMs: p.holdMs,
       colorSync: !!colorSync, fullscreen: !!fullscreen, version: p.maxVersion
     };
   };
 
   /* 依据当前屏幕像素尺寸计算布局参数（整数模块像素、版本、绘制尺寸、分包大小） */
   function computeChunkSize(W, H) {
-    var P = QRProtocol.computeLayoutParams(W, H, cfg.maxVersion);
+    var P = QRProtocol.computeLayoutParams(W, H, cfg.maxVersion, cfg.px);
     cfg.cols = QRProtocol.GRID_COLS;
     cfg.rows = QRProtocol.GRID_ROWS;
     cfg.version = P.version;
@@ -12988,14 +12993,14 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     order = shuffle(arr); pos = 0;
   }
 
-  /* 每帧槽位 0 固定为元数据包（可靠性优先：接收端只要锁住 0 号码位
-   * 就能立即拿到文件信息并显示进度）；
+  /* 每帧挑选一窗口的包；0 号码位每 8 帧显示元数据（其余时间传数据，
+   * 不再浪费 1/6 容量），元数据仍能保证在 ~2 秒内到达；
    * 数据队列耗尽即重建（小文件也会循环重发全部数据包）；
    * 小文件（数据包不足 6 个）时剩余槽位用元数据填充：所有码位都有内容 */
   function nextFramePacketIndexes() {
     var n = cfg.cols * cfg.rows;
     var out = new Array(n).fill(null);
-    if (meta && n > 0) out[0] = 0;
+    if (meta && n > 0 && frameNo % 8 === 0) out[0] = 0;
     for (var i = 0; i < n; i++) {
       if (out[i] !== null) continue;
       if (!meta || meta.chunks === 0) continue;
@@ -13294,17 +13299,8 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
   function doRelocate() {
     lastRelocate = performance.now();
-    /* 阶段 A：整帧 jsQR 找种子码（jsQR 已打补丁，可在 3×2 密集码阵中找到至少一个） */
-    var seedImg = pctx.getImageData(0, 0, proc.width, proc.height);
-    var seed = jsQR(seedImg.data, seedImg.width, seedImg.height);
-    if (!seed) {
-      if (!regions.length) setStatus('未检测到二维码：请对准屏幕并保持稳定（距离 30~60cm，避免反光）');
-      return;
-    }
-    /* 阶段 B：收集「码位 ↔ 实际位置」对应关系（包内 cell 字段 + jsQR 定位中心） */
     var corr = [];
     var sizes = [];
-    var g = QRProtocol.deriveGrid(seed);
     function addCorr(qr, ox, oy) {
       var pkt = QRProtocol.decodePacket(qr.binaryData);
       if (!pkt) return;
@@ -13314,35 +13310,59 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       sizes.push(dg.qrSize);
       handlePacket(pkt);
     }
-    addCorr(seed, 0, 0);  /* 种子本身即一个对应点（整帧坐标） */
-    /* 均匀网格候选扫描（覆盖全部可能码位） */
-    var offsets = QRProtocol.candidateOffsets();
-    var half = g.qrSize / 2 + 4;
-    var side = Math.round(g.qrSize + 8);
-    for (var i = 0; i < offsets.length; i++) {
-      var cx = g.centerX + offsets[i][0] * g.pitch;
-      var cy = g.centerY + offsets[i][1] * g.pitch;
-      if (cx - half < 0 || cy - half < 0 || cx + half > proc.width || cy + half > proc.height) continue;
-      var rx = Math.round(cx - half), ry = Math.round(cy - half);
-      var qr = cropAndDecode(proc, rx, ry, side, side);
-      if (qr && qr.binaryData) addCorr(qr, rx, ry);
+    /* 阶段 A：整帧 jsQR 找种子码（补丁后可在密集码阵中找到至少一个） */
+    var seedImg = pctx.getImageData(0, 0, proc.width, proc.height);
+    var seed = jsQR(seedImg.data, seedImg.width, seedImg.height);
+    if (seed) {
+      addCorr(seed, 0, 0);
+      /* 均匀网格候选扫描（宽容裁剪，容纳透视/尺寸推导误差） */
+      var g = QRProtocol.deriveGrid(seed);
+      var offsets = QRProtocol.candidateOffsets();
+      var side = Math.round(g.qrSize * 1.3);
+      var half = side / 2;
+      for (var i = 0; i < offsets.length; i++) {
+        var cx = g.centerX + offsets[i][0] * g.pitch;
+        var cy = g.centerY + offsets[i][1] * g.pitch;
+        if (cx - half < 0 || cy - half < 0 || cx + half > proc.width || cy + half > proc.height) continue;
+        var rx = Math.round(cx - half), ry = Math.round(cy - half);
+        var qr = cropAndDecode(proc, rx, ry, side, side);
+        if (qr && qr.binaryData) addCorr(qr, rx, ry);
+      }
+    }
+    /* 阶段 B（兜底）：种子失败或对应点不足时，用粗瓦片扫描收集对应点
+     * （单码裁剪比整帧密集搜索更抗透视/模糊，避免“卡住”扫不到） */
+    if (corr.length < 3) {
+      var tcorr = tileScan();
+      for (var ti = 0; ti < tcorr.length; ti++) {
+        corr.push(tcorr[ti]);
+        sizes.push(tcorr[ti].size);
+      }
+    }
+    if (!corr.length) {
+      if (!regions.length) setStatus('未检测到二维码：请对准屏幕并保持稳定（距离 30~60cm，避免反光）');
+      return;
     }
     /* 阶段 C：仿射拟合修正透视/偏移 → 计算全部 6 个码位 → 逐格验证锁定 */
-    var medSize = median(sizes) || g.qrSize;
+    var medSize = median(sizes) || (g ? g.qrSize : 320);
     var T = corr.length >= 3 ? QRProtocol.fitAffine(corr) : null;
     var found = [];
     if (T) {
-      var cside = Math.round(medSize + 8);
-      var chalf = medSize / 2 + 4;
+      /* 验证裁剪：比码略大（容纳透视残差）但小于码距（避免含入邻码）；
+       * 越界检查放宽（边缘码位由 cropAndDecode 钳制处理） */
+      var cside = Math.round(medSize * 1.06);
       for (var cellId = 0; cellId < 6; cellId++) {
         var pos = T.apply(cellId);
-        if (pos.x - chalf < 0 || pos.y - chalf < 0 || pos.x + chalf > proc.width || pos.y + chalf > proc.height) continue;
+        var chalf = cside / 2;
+        if (pos.x + cside < 0 || pos.y + cside < 0 || pos.x - cside > proc.width || pos.y - cside > proc.height) continue;
         var rx = Math.round(pos.x - chalf), ry = Math.round(pos.y - chalf);
         var qr2 = cropAndDecode(proc, rx, ry, cside, cside);
         if (qr2 && qr2.binaryData) {
           var pkt2 = QRProtocol.decodePacket(qr2.binaryData);
           if (pkt2 && pkt2.cell === cellId) {   /* 码位号校验几何正确性 */
-            found.push({ cell: cellId, x: rx, y: ry, w: cside, h: cside, fails: 0, ok: 1 });
+            var dg2 = QRProtocol.deriveGrid(qr2);
+            /* 区域以解码出的二维码实际位置与尺寸为准（紧贴，透视下更稳） */
+            var rs = Math.round(dg2.qrSize + 8);
+            found.push({ cell: cellId, x: Math.round(dg2.centerX + rx - rs / 2), y: Math.round(dg2.centerY + ry - rs / 2), w: rs, h: rs, fails: 0, ok: 1 });
             handlePacket(pkt2);
           }
         }
@@ -13367,6 +13387,32 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     }
   }
 
+  /* 粗瓦片扫描：半帧大小的瓦片（≥ 单码尺寸，保证整码落入瓦片内）按半幅步进
+   * 覆盖全帧，收集「码位↔位置」对应。单码裁剪比整帧搜索更抗透视与模糊，
+   * 是种子/候选扫描失败时的主要兜底。 */
+  function tileScan() {
+    var out = [];
+    var tw = Math.floor(proc.width / 2), th = Math.floor(proc.height / 2);
+    var xstep = Math.floor(tw / 2), ystep = Math.floor(th / 2);
+    var nx = Math.ceil((proc.width - tw) / xstep) + 1;
+    var ny = Math.ceil((proc.height - th) / ystep) + 1;
+    for (var r = 0; r < ny; r++) {
+      for (var c = 0; c < nx; c++) {
+        var x = Math.min(proc.width - tw, Math.round(c * xstep));
+        var y = Math.min(proc.height - th, Math.round(r * ystep));
+        var qr = cropAndDecode(proc, x, y, tw, th);
+        if (qr && qr.binaryData) {
+          var pkt = QRProtocol.decodePacket(qr.binaryData);
+          if (pkt) {
+            var dg = QRProtocol.deriveGrid(qr);
+            out.push({ cell: pkt.cell, x: dg.centerX + x, y: dg.centerY + y, size: dg.qrSize });
+          }
+        }
+      }
+    }
+    return out;
+  }
+
   function median(arr) {
     if (!arr.length) return 0;
     var a = arr.slice().sort(function (x, y) { return x - y; });
@@ -13374,14 +13420,20 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   }
 
   function cropAndDecode(src, x, y, w, h) {
-    if (!crop || crop.width < w || crop.height < h) {
+    /* 裁剪范围钳制到画布内（靠边码位只损失少量静区，仍可解码） */
+    var cx = Math.max(0, Math.round(x));
+    var cy = Math.max(0, Math.round(y));
+    var cw = Math.min(w, src.width - cx);
+    var ch = Math.min(h, src.height - cy);
+    if (cw < 40 || ch < 40) return null;
+    if (!crop || crop.width < cw || crop.height < ch) {
       crop = document.createElement('canvas');
-      crop.width = w; crop.height = h;
+      crop.width = cw; crop.height = ch;
       cctx = crop.getContext('2d', { willReadFrequently: true });
     }
-    cctx.drawImage(src, x, y, w, h, 0, 0, w, h);
-    var img = cctx.getImageData(0, 0, w, h);
-    return jsQR(img.data, w, h);
+    cctx.drawImage(src, cx, cy, cw, ch, 0, 0, cw, ch);
+    var img = cctx.getImageData(0, 0, cw, ch);
+    return jsQR(img.data, cw, ch);
   }
 
   function decodeRegions() {

@@ -119,7 +119,7 @@ ok(!!Sender && !!UI, 'Sender / UI 已暴露');
   Sender.setConfig('balanced', true, false);
   Sender.setFile('smoke-test.bin', bytes);
   const est = Sender.estimate();
-  ok(est && est.chunkSize > 0 && est.cols >= 1 && est.rows >= 1 && est.version >= 1 && est.version <= 20,
+  ok(est && est.chunkSize > 0 && est.cols >= 1 && est.rows >= 1 && est.version >= 1 && est.version <= 40,
     `预估正常 chunk=${est.chunkSize} 码阵=${est.cols}x${est.rows} v${est.version} bps≈${Math.round(est.bps)}`);
   Sender.start();
   const canvas = elements['txCanvas'];

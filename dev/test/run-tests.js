@@ -184,13 +184,15 @@ console.log('\n== 分包 / 组包 / 丢包 / 篡改 ==');
 
 console.log('\n== 布局参数（整数模块像素，模块均匀） ==');
 {
-  const P = Proto.computeLayoutParams(1280, 853, 17);
+  const P = Proto.computeLayoutParams(1280, 853, 29, 4);
   ok(P.px >= 3 && P.qrDrawn === P.px * P.total && P.total === P.version * 4 + 25,
-     `1280x853 平衡: px=${P.px} v${P.version} qrDrawn=${P.qrDrawn} chunk=${P.chunkSize}`);
-  const P2 = Proto.computeLayoutParams(1920, 1080, 17);
-  ok(P2.px >= 4 && P2.version === 17, `1920x1080 平衡: px=${P2.px} v${P2.version} qrDrawn=${P2.qrDrawn}`);
-  const P3 = Proto.computeLayoutParams(1920, 1080, 20);
-  ok(P3.version === 20 && P3.px >= 4, `1920x1080 高速: px=${P3.px} v${P3.version} qrDrawn=${P3.qrDrawn}`);
+     `1280x853 标准: px=${P.px} v${P.version} qrDrawn=${P.qrDrawn} chunk=${P.chunkSize}`);
+  const P2 = Proto.computeLayoutParams(1920, 1080, 29, 4);
+  ok(P2.px >= 4 && P2.version >= 20, `1920x1080 标准: px=${P2.px} v${P2.version} qrDrawn=${P2.qrDrawn}`);
+  const P3 = Proto.computeLayoutParams(1920, 1080, 33, 3);
+  ok(P3.px === 3 && P3.version >= 29, `1920x1080 高速: px=${P3.px} v${P3.version} qrDrawn=${P3.qrDrawn} chunk=${P3.chunkSize}`);
+  const P4 = Proto.computeLayoutParams(1280, 853, 33, 3);
+  ok(P4.version >= 20, `1280x853 高速: px=${P4.px} v${P4.version} chunk=${P4.chunkSize}`);
   /* 布局适配检查：网格必须落在白色区域内 */
   const L = Proto.gridLayout(1280, 853, P.qrDrawn);
   const gridW = 3 * P.qrDrawn + 2 * L.gap, gridH = 2 * P.qrDrawn + L.gap;
@@ -203,6 +205,24 @@ console.log('\n== 布局参数（整数模块像素，模块均匀） ==');
   const res = jsQR(img.data, img.width, img.height);
   const dg = res ? Proto.deriveGrid(res) : null;
   ok(dg && Math.abs(dg.qrSize - P.qrDrawn) < 2, `接收端推导尺寸 ${dg ? Math.round(dg.qrSize) : '-'} ≈ 发送端绘制 ${P.qrDrawn}`);
+}
+
+console.log('\n== 高版本大负载 @3px 整数模块（高速档可靠性） ==');
+{
+  for (const [ver, px] of [[25, 3], [29, 3], [33, 3]]) {
+    const cap = Proto.CAPACITY_L[ver];
+    const payload = new Uint8Array(cap - 40);
+    for (let i = 0; i < payload.length; i++) payload[i] = (i * 131 + 29) & 255;
+    const pkt = Proto.encodePacket(1, 100, payload, false, 0);
+    let okc = 0;
+    for (let t = 0; t < 5; t++) {
+      const qr = encodeQr(pkt);
+      const img = qrToImageData(qr, px);
+      const res = jsQR(img.data, img.width, img.height);
+      if (res && Buffer.compare(Buffer.from(res.binaryData), Buffer.from(pkt)) === 0) okc++;
+    }
+    ok(okc === 5, `v${ver}（负载 ${payload.length}B @${px}px 整数模块）往返 ${okc}/5`);
+  }
 }
 
 console.log('\n== v20 大负载数据包的 QR 往返 ==');

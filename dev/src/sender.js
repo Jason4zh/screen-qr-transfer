@@ -11,10 +11,11 @@
   var Sender = {};
 
   var PALETTE = ['#E53935', '#43A047', '#1E88E5', '#FDD835'];
+  /* 档位：模块像素 px（4=稳 / 3=快），版本上限随屏幕自适应，帧间隔 holdMs */
   var PRESETS = {
-    stable:   { maxVersion: 13, holdMs: 450 },
-    balanced: { maxVersion: 17, holdMs: 250 },
-    fast:     { maxVersion: 20, holdMs: 150 }
+    stable:   { px: 4, maxVersion: 17, holdMs: 400 },
+    balanced: { px: 4, maxVersion: 29, holdMs: 200 },
+    fast:     { px: 3, maxVersion: 33, holdMs: 150 }
   };
 
   var fileBytes = null, fileName = '';
@@ -33,14 +34,14 @@
     var p = PRESETS[presetName] || PRESETS.balanced;
     cfg = {
       cols: QRProtocol.GRID_COLS, rows: QRProtocol.GRID_ROWS,
-      maxVersion: p.maxVersion, holdMs: p.holdMs,
+      px: p.px, maxVersion: p.maxVersion, holdMs: p.holdMs,
       colorSync: !!colorSync, fullscreen: !!fullscreen, version: p.maxVersion
     };
   };
 
   /* 依据当前屏幕像素尺寸计算布局参数（整数模块像素、版本、绘制尺寸、分包大小） */
   function computeChunkSize(W, H) {
-    var P = QRProtocol.computeLayoutParams(W, H, cfg.maxVersion);
+    var P = QRProtocol.computeLayoutParams(W, H, cfg.maxVersion, cfg.px);
     cfg.cols = QRProtocol.GRID_COLS;
     cfg.rows = QRProtocol.GRID_ROWS;
     cfg.version = P.version;
@@ -79,14 +80,14 @@
     order = shuffle(arr); pos = 0;
   }
 
-  /* 每帧槽位 0 固定为元数据包（可靠性优先：接收端只要锁住 0 号码位
-   * 就能立即拿到文件信息并显示进度）；
+  /* 每帧挑选一窗口的包；0 号码位每 8 帧显示元数据（其余时间传数据，
+   * 不再浪费 1/6 容量），元数据仍能保证在 ~2 秒内到达；
    * 数据队列耗尽即重建（小文件也会循环重发全部数据包）；
    * 小文件（数据包不足 6 个）时剩余槽位用元数据填充：所有码位都有内容 */
   function nextFramePacketIndexes() {
     var n = cfg.cols * cfg.rows;
     var out = new Array(n).fill(null);
-    if (meta && n > 0) out[0] = 0;
+    if (meta && n > 0 && frameNo % 8 === 0) out[0] = 0;
     for (var i = 0; i < n; i++) {
       if (out[i] !== null) continue;
       if (!meta || meta.chunks === 0) continue;
