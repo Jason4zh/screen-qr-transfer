@@ -80,14 +80,17 @@
     order = shuffle(arr); pos = 0;
   }
 
-  /* 每帧挑选一窗口的包；0 号码位每 8 帧显示元数据（其余时间传数据，
-   * 不再浪费 1/6 容量），元数据仍能保证在 ~2 秒内到达；
+  /* 每帧挑选一窗口的包；元数据每 4 帧出现一次，并轮换到不同码位
+   * （没有任何码位被独占 → 即使某个码位持续失败，元数据也会经由其他
+   * 码位到达，杜绝“数据收齐却因缺元数据而卡死”）；
    * 数据队列耗尽即重建（小文件也会循环重发全部数据包）；
    * 小文件（数据包不足 6 个）时剩余槽位用元数据填充：所有码位都有内容 */
   function nextFramePacketIndexes() {
     var n = cfg.cols * cfg.rows;
     var out = new Array(n).fill(null);
-    if (meta && n > 0 && frameNo % 8 === 0) out[0] = 0;
+    if (meta && n > 0 && frameNo % 4 === 0) {
+      out[Math.floor(frameNo / 4) % n] = 0;   /* 元数据轮换码位 */
+    }
     for (var i = 0; i < n; i++) {
       if (out[i] !== null) continue;
       if (!meta || meta.chunks === 0) continue;

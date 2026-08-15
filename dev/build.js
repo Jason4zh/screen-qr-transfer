@@ -32,6 +32,6 @@ if (/<\/script/i.test(scriptBody[1])) { console.error('内联脚本中含 </scri
 try { new Function(scriptBody[1]); }
 catch (e) { console.error('内联脚本语法错误:', e.message); process.exit(1); }
 
-const dest = path.join(root, '..', 'screen-qr-transfer.html');
+const dest = path.join(root, '..', 'index.html');
 fs.writeFileSync(dest, out);
 console.log('✔ 已生成 ' + dest + '（' + out.length + ' 字节）');

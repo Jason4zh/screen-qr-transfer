@@ -1,4 +1,4 @@
-chcp 65001 >nul
+﻿chcp 65001 >nul
 title 屏码传 - 局域网服务
 cd /d "%~dp0"
 
@@ -22,15 +22,15 @@ echo  [2/2] 正在启动 HTTP 服务（端口 8000）...
 echo.
 echo  >>> 请确保手机与电脑连接同一 Wi-Fi，然后在手机浏览器打开：
 echo.
-echo       http://%IP%:8000/screen-qr-transfer.html
+echo       http://%IP%:8000/index.html
 echo.
 echo  （按 Ctrl+C 可停止服务）
 echo.
 
-if exist screen-qr-transfer.html (
-  start "" "http://%IP%:8000/screen-qr-transfer.html"
+if exist index.html (
+  start "" "http://%IP%:8000/index.html"
 ) else (
-  echo  [警告] 未找到 screen-qr-transfer.html，请确认本文件与页面在同一目录！
+  echo  [警告] 未找到 index.html，请确认本文件与页面在同一目录！
 )
 
 where python >nul 2>nul
@@ -44,5 +44,5 @@ if %errorlevel%==0 (
   goto :eof
 )
 echo  [错误] 未找到 Python，无法启动本地服务。
-echo  请改用其他方式把 screen-qr-transfer.html 发送到手机，用浏览器打开。
+echo  请改用其他方式把 index.html 发送到手机，用浏览器打开。
 pause

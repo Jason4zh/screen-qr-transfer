@@ -229,19 +229,19 @@ function session(fileBytes, opts) {
 
   const maxFrames = opts.maxFrames || 300;
   for (frames = 0; frames < maxFrames && (got < meta.chunks || !metaSeen); frames++) {
-    /* 槽位（与 sender.js 一致）：0 号码位每 8 帧显示元数据（其余传数据）；
+    /* 槽位（与 sender.js 一致）：元数据每 4 帧轮换码位（无独占码位）；
      * 队列耗尽重建；小文件剩余槽位填元数据 */
     const slots = new Array(6).fill(null);
-    if (frames % 8 === 0) slots[0] = 0;
+    if (frames % 4 === 0) slots[Math.floor(frames / 4) % 6] = 0;
     for (let i = 0; i < 6; i++) {
       if (slots[i] !== null) continue;
       if (order.length === 0 || pos >= meta.chunks) reshuffle();
       if (pos < meta.chunks) { slots[i] = order[pos++]; }
       else { slots[i] = 0; }
     }
-    /* 随机丢一个码位（模拟某区域失败） */
-    const dropCell = (Math.random() * 6) | 0;
-    const payloads = slots.map((ix, cell) => (cell === dropCell || ix == null) ? null : patchCell(packets[ix], cell));
+    /* 失败模型：opts.failCell 为持续失败码位（反光/遮挡）；否则每帧随机丢一个码位 */
+    const failCell = (typeof opts.failCell === 'number') ? opts.failCell : ((Math.random() * 6) | 0);
+    const payloads = slots.map((ix, cell) => (cell === failCell || ix == null) ? null : patchCell(packets[ix], cell));
     let img = renderFrame(payloads, W, H, frames % 4, L, px);
     if (opts.warp) img = warp(img.data, W, H, opts.warp.dstW, opts.warp.dstH, opts.warp.corners);
     addNoise(img, 0.002);
@@ -368,6 +368,19 @@ console.log('\n== 场景 5：高速档（1920×1080，px=3，v33） ==');
      Buffer.compare(Buffer.from(assembled), Buffer.from(fileBytes)) === 0,
      `高速档 ${frames} 帧收齐 ${meta.chunks} 包，CRC 一致（仿真 ${(fileBytes.length / 1024 / Math.max(0.001, elapsed)).toFixed(0)} KB/s）`);
   ok(metaSeen, '高速档元数据已收到');
+}
+
+console.log('\n== 场景 6：0 号码位持续失败（反光/遮挡）——轮换元数据防卡死 ==');
+{
+  const fileBytes = new Uint8Array(40000);
+  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 73 + 19) & 255;
+  const r = session(fileBytes, { maxFrames: 300, failCell: 0 });
+  ok(r.got === r.meta.chunks, `0 号码位持续失败仍收齐 ${r.meta.chunks} 包（${r.frames} 帧）`);
+  ok(r.metaSeen, '元数据经轮换码位到达（不再卡死）');
+  const assembled = Proto.assemble(r.meta, r.chunks);
+  ok(assembled && Proto.crc32(assembled) === r.meta.crc32 &&
+     Buffer.compare(Buffer.from(assembled), Buffer.from(r.fileBytes)) === 0, '整文件 CRC 校验一致');
+  console.log(`  帧数=${r.frames}`);
 }
 
 console.log(`\n结果：${passed} 通过, ${failed} 失败`);

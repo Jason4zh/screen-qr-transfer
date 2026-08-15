@@ -11,7 +11,7 @@
   var PROC_MAX_W = 1280;              /* 处理画布最大宽度（性能上限） */
 
   var video = null, proc = null, pctx = null, overlay = null, octx = null;
-  var crop = null, cctx = null;
+  var crop = null, cctx = null, sCanvas = null, sctx = null;
   var stream = null, running = false, timer = null;
   var regions = [];                   /* {x,y,w,h,fails,ok} */
   var needRelocate = true, lastRelocate = 0, failStreak = 0;
@@ -94,10 +94,16 @@
     pctx.drawImage(video, 0, 0, proc.width, proc.height);
     if (needRelocate && now - lastRelocate > 400) doRelocate();
     else if (regions.length) decodeRegions();
-    /* 码位未锁满时每 3 秒重新定位（尽快补全）；锁满后每 30 秒防漂移 */
+    /* 重定位节奏：码位过少 / 有码位持续失败 / 尚未收到元数据 → 每 3 秒；
+     * 一切正常 → 每 30 秒防漂移（避免频繁全帧扫描阻塞解码） */
     var expected = 6;
     if (meta) expected = Math.min(6, meta.chunks + 1);
-    if (now - lastRelocate > (regions.length >= expected ? 30000 : 3000)) needRelocate = true;
+    var anyBad = false;
+    for (var bi = 0; bi < regions.length; bi++) {
+      if (regions[bi].fails > 5) { anyBad = true; break; }
+    }
+    var needFast = regions.length < 3 || anyBad || !meta;
+    if (now - lastRelocate > (needFast ? 3000 : 30000)) needRelocate = true;
     drawOverlay();
     updateUI();
   }
@@ -110,6 +116,36 @@
       proc.width = w; proc.height = h;
       pctx = proc.getContext('2d', { willReadFrequently: true });
     }
+  }
+
+  /* 降采样种子搜索：整帧缩到 ~640 宽再 jsQR（补丁后各尺度均可靠），
+   * 比全分辨率快约 4 倍；把 location 映射回全分辨率坐标 */
+  function seedSearch() {
+    var dw = Math.min(640, proc.width);
+    var dh = Math.max(2, Math.round(dw * proc.height / proc.width));
+    if (!sCanvas) { sCanvas = document.createElement('canvas'); sctx = sCanvas.getContext('2d', { willReadFrequently: true }); }
+    sCanvas.width = dw; sCanvas.height = dh;
+    sctx.drawImage(proc, 0, 0, dw, dh);
+    var img = sctx.getImageData(0, 0, dw, dh);
+    var seed = jsQR(img.data, dw, dh);
+    if (!seed) return null;
+    var s = proc.width / dw;
+    var loc = seed.location;
+    function scalePt(p) { return { x: p.x * s, y: p.y * s }; }
+    return {
+      version: seed.version,
+      binaryData: seed.binaryData,
+      location: {
+        topLeftCorner: scalePt(loc.topLeftCorner),
+        topRightCorner: scalePt(loc.topRightCorner),
+        bottomLeftCorner: scalePt(loc.bottomLeftCorner),
+        bottomRightCorner: scalePt(loc.bottomRightCorner),
+        topLeftFinderPattern: scalePt(loc.topLeftFinderPattern),
+        topRightFinderPattern: scalePt(loc.topRightFinderPattern),
+        bottomLeftFinderPattern: scalePt(loc.bottomLeftFinderPattern),
+        bottomRightAlignmentPattern: loc.bottomRightAlignmentPattern ? scalePt(loc.bottomRightAlignmentPattern) : null
+      }
+    };
   }
 
   function doRelocate() {
@@ -125,9 +161,8 @@
       sizes.push(dg.qrSize);
       handlePacket(pkt);
     }
-    /* 阶段 A：整帧 jsQR 找种子码（补丁后可在密集码阵中找到至少一个） */
-    var seedImg = pctx.getImageData(0, 0, proc.width, proc.height);
-    var seed = jsQR(seedImg.data, seedImg.width, seedImg.height);
+    /* 阶段 A：降采样整帧搜索种子码（补丁后可在密集码阵中找到至少一个） */
+    var seed = seedSearch();
     if (seed) {
       addCorr(seed, 0, 0);
       /* 均匀网格候选扫描（宽容裁剪，容纳透视/尺寸推导误差） */
