@@ -44,8 +44,11 @@
     var est = Sender.estimate();
     var tip = '';
     if (est) {
+      var n = Math.ceil(file.size / est.chunkSize);
+      var blocks = Math.ceil(n / QRProtocol.FEC_DEFAULT_N);
+      var K = Math.max(4, Math.min(50, Math.round(Math.min(QRProtocol.FEC_DEFAULT_N, n) * 0.2)));
       tip = '码阵 ' + est.cols + '×' + est.rows + '（QR v' + est.version + '）· 每包约 ' + QRProtocol.fmtBytes(est.chunkSize) +
-        ' · 共 ' + Math.ceil(file.size / est.chunkSize) + ' 包<br>' +
+        ' · 数据 ' + n + ' 包 + 纠删冗余 ' + (blocks * K) + ' 包<br>' +
         '按典型效率估算：约 ' + QRProtocol.fmtTime(est.seconds) + '（实际取决于光线与手机性能）';
     }
     $('fileInfo').innerHTML = '<b>' + QRProtocol.esc(file.name) + '</b><br>' +
@@ -77,9 +80,23 @@
   $('fileInput').addEventListener('change', function (e) {
     if (e.target.files && e.target.files[0]) onFile(e.target.files[0]);
   });
-  $('speedSel').addEventListener('change', syncConfig);
+  $('speedSel').addEventListener('change', function () {
+    syncConfig();
+    /* 切换档位时，帧间隔恢复该档默认值 */
+    $('intervalSlider').value = Sender.presetInterval($('speedSel').value);
+    refreshInterval();
+  });
   $('colorSyncChk').addEventListener('change', syncConfig);
   $('fullscreenChk').addEventListener('change', syncConfig);
+
+  /* 自定义帧间隔（100~1000ms，可覆盖档位默认） */
+  function refreshInterval() {
+    var ms = parseInt($('intervalSlider').value, 10);
+    Sender.setInterval(ms);
+    $('intervalVal').textContent = ms + 'ms（' + (1000 / ms).toFixed(1) + ' 帧/秒）';
+  }
+  $('intervalSlider').addEventListener('input', refreshInterval);
+  refreshInterval();
 
   /* ---------- 发送控制 ---------- */
   $('btnStart').addEventListener('click', function () {

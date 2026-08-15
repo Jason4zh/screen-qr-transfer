@@ -201,15 +201,16 @@ function locate(img, handlePkt) {
 
 /* 传输会话：布局与分块统一由 computeLayoutParams 决定（与 sender.js 一致） */
 function session(fileBytes, opts) {
-  const W = 1280, H = 853;
+  const W = opts.W || 1280, H = opts.H || 853;
   const P = Proto.computeLayoutParams(W, H, opts.maxVersion || 29, opts.px || 4);
   const L = Proto.gridLayout(W, H, P.qrDrawn);
   const px = P.px;
   const chunkSize = P.chunkSize;
-  const { packets, meta } = Proto.packetize(fileBytes, 'sim.bin', chunkSize);
+  const fecN = opts.fecN === 0 ? 0 : (opts.fecN || Proto.FEC_DEFAULT_N);
+  const { packets, meta } = Proto.packetize(fileBytes, 'sim.bin', chunkSize, fecN, 0);
 
   const order = [];
-  for (let i = 1; i <= meta.chunks; i++) order.push(i);
+  for (let i = 1; i < packets.length; i++) order.push(i);   /* 数据 + FEC 奇偶 */
   let pos = 0;
   function reshuffle() {
     for (let j = order.length - 1; j > 0; j--) { const k = (Math.random() * (j + 1)) | 0; const t = order[j]; order[j] = order[k]; order[k] = t; }
@@ -217,14 +218,54 @@ function session(fileBytes, opts) {
   }
 
   const chunks = new Array(meta.chunks);
-  const received = new Uint8Array(meta.chunks + 1);
   let got = 0, frames = 0, metaSeen = false, regions = [];
+  /* FEC 分块接收（与 receiver.js 同算法） */
+  const info = Proto.fecBlockInfo(meta);
+  const blockData = new Array(Math.max(1, info.blocks)), blockParity = new Array(Math.max(1, info.blocks));
+  const blockHave = new Array(Math.max(1, info.blocks)).fill(0), blockDone = new Uint8Array(Math.max(1, info.blocks));
+  for (let b = 0; b < info.blocks; b++) {
+    blockData[b] = new Array(info.dataCount(b)).fill(null);
+    blockParity[b] = new Array(info.K).fill(null);
+  }
+  function tryDecodeBlock(b) {
+    if (blockDone[b]) return;
+    const count = info.dataCount(b);
+    const present = [];
+    for (let i = 0; i < count; i++) if (blockData[b][i]) {
+      const r = new Array(count).fill(0); r[i] = 1;
+      present.push({ row: r, symbols: blockData[b][i] });
+    }
+    const prs = Proto.fecParityRows(count, info.K);
+    for (let p2 = 0; p2 < info.K; p2++) if (blockParity[b][p2]) present.push({ row: prs[p2], symbols: blockParity[b][p2] });
+    if (present.length < count) return;
+    const rec = Proto.fecDecode(present, count);
+    if (!rec) return;
+    blockDone[b] = 1;
+    const base = b * meta.fecN;
+    for (let i = 0; i < count; i++) if (!chunks[base + i]) { chunks[base + i] = rec[i]; got++; }
+  }
   const handlePkt = (pkt) => {
     if (pkt.isMeta) { metaSeen = true; return; }
-    if (pkt.index >= 1 && pkt.index <= meta.chunks && !received[pkt.index]) {
-      received[pkt.index] = 1; got++;
-      chunks[pkt.index - 1] = pkt.payload;
+    if (info.blocks === 0) {
+      if (pkt.isParity) return;
+      if (pkt.index >= 1 && pkt.index <= meta.chunks && !chunks[pkt.index - 1]) {
+        chunks[pkt.index - 1] = pkt.payload; got++;
+      }
+      return;
     }
+    let b, ppos;
+    if (!pkt.isParity) {
+      b = Math.floor((pkt.index - 1) / meta.fecN); ppos = (pkt.index - 1) % meta.fecN;
+      if (blockData[b][ppos]) return;
+      blockData[b][ppos] = pkt.payload; blockHave[b]++;
+    } else {
+      const pp = pkt.index - meta.chunks - 1;
+      if (pp < 0 || info.K <= 0) return;
+      b = Math.floor(pp / info.K); ppos = pp % info.K;
+      if (blockParity[b][ppos]) return;
+      blockParity[b][ppos] = pkt.payload; blockHave[b]++;
+    }
+    if (blockHave[b] >= info.dataCount(b)) tryDecodeBlock(b);
   };
 
   const maxFrames = opts.maxFrames || 300;
@@ -235,8 +276,8 @@ function session(fileBytes, opts) {
     if (frames % 4 === 0) slots[Math.floor(frames / 4) % 6] = 0;
     for (let i = 0; i < 6; i++) {
       if (slots[i] !== null) continue;
-      if (order.length === 0 || pos >= meta.chunks) reshuffle();
-      if (pos < meta.chunks) { slots[i] = order[pos++]; }
+      if (order.length === 0 || pos >= order.length) reshuffle();
+      if (pos < order.length) { slots[i] = order[pos++]; }
       else { slots[i] = 0; }
     }
     /* 失败模型：opts.failCell 为持续失败码位（反光/遮挡）；否则每帧随机丢一个码位 */
@@ -259,7 +300,7 @@ function session(fileBytes, opts) {
       handlePkt(pkt);
     }
   }
-  return { frames, got, metaSeen, chunks, meta, received, regions, fileBytes };
+  return { frames, got, metaSeen, chunks, meta, regions, fileBytes };
 }
 
 /* ---------- 测试主体 ---------- */
@@ -317,57 +358,13 @@ console.log('\n== 场景 5：高速档（1920×1080，px=3，v33） ==');
 {
   const fileBytes = new Uint8Array(300000);
   for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 61 + 11) & 255;
-  /* 1920×1080 帧（与真实全屏一致） */
+  const r = session(fileBytes, { W: 1920, H: 1080, maxVersion: 33, px: 3, maxFrames: 200 });
   const P = Proto.computeLayoutParams(1920, 1080, 33, 3);
-  const L = Proto.gridLayout(1920, 1080, P.qrDrawn);
-  console.log(`  布局: px=${P.px} v${P.version} qrDrawn=${P.qrDrawn} chunk=${P.chunkSize}（单帧 ≈${(P.chunkSize * 6 / 1024).toFixed(1)}KB）`);
-  const { packets, meta } = Proto.packetize(fileBytes, 'fast.bin', P.chunkSize);
-  const order = [];
-  for (let i = 1; i <= meta.chunks; i++) order.push(i);
-  let pos = 0;
-  function reshuffle() {
-    for (let j = order.length - 1; j > 0; j--) { const k = (Math.random() * (j + 1)) | 0; const t = order[j]; order[j] = order[k]; order[k] = t; }
-    pos = 0;
-  }
-  const chunks = new Array(meta.chunks);
-  const received = new Uint8Array(meta.chunks + 1);
-  let got = 0, metaSeen = false, regions = [];
-  const handlePkt = (pkt) => {
-    if (pkt.isMeta) { metaSeen = true; return; }
-    if (pkt.index >= 1 && pkt.index <= meta.chunks && !received[pkt.index]) {
-      received[pkt.index] = 1; got++;
-      chunks[pkt.index - 1] = pkt.payload;
-    }
-  };
-  const t0 = Date.now();
-  let frames = 0;
-  for (frames = 0; frames < 200 && (got < meta.chunks || !metaSeen); frames++) {
-    const slots = new Array(6).fill(null);
-    if (frames % 8 === 0) slots[0] = 0;
-    for (let i = 0; i < 6; i++) {
-      if (slots[i] !== null) continue;
-      if (order.length === 0 || pos >= meta.chunks) reshuffle();
-      if (pos < meta.chunks) { slots[i] = order[pos++]; } else { slots[i] = 0; }
-    }
-    const payloads = slots.map((ix, cell) => patchCell(packets[ix], cell));
-    const img = renderFrame(payloads, 1920, 1080, frames % 4, L, P.px);
-    if (frames % 10 === 0) regions = locate(img, handlePkt);
-    for (const rg of regions) {
-      const t = crop(img, rg.x, rg.y, rg.w, rg.h);
-      if (!t) continue;
-      const qr = jsQR(t.data, t.width, t.height);
-      if (!qr) continue;
-      const pkt = Proto.decodePacket(qr.binaryData);
-      if (!pkt) continue;
-      handlePkt(pkt);
-    }
-  }
-  const elapsed = (Date.now() - t0) / 1000;
-  const assembled = Proto.assemble(meta, chunks);
-  ok(got === meta.chunks && assembled && Proto.crc32(assembled) === meta.crc32 &&
-     Buffer.compare(Buffer.from(assembled), Buffer.from(fileBytes)) === 0,
-     `高速档 ${frames} 帧收齐 ${meta.chunks} 包，CRC 一致（仿真 ${(fileBytes.length / 1024 / Math.max(0.001, elapsed)).toFixed(0)} KB/s）`);
-  ok(metaSeen, '高速档元数据已收到');
+  console.log(`  布局: px=${P.px} v${P.version} qrDrawn=${P.qrDrawn} chunk=${P.chunkSize}（单帧 ≈${(P.chunkSize * 6 / 1024).toFixed(1)}KB，含 FEC 奇偶）`);
+  ok(r.got === r.meta.chunks && r.metaSeen, `高速档 ${r.frames} 帧收齐 ${r.meta.chunks} 块`);
+  const assembled = Proto.assemble(r.meta, r.chunks);
+  ok(assembled && Proto.crc32(assembled) === r.meta.crc32 &&
+     Buffer.compare(Buffer.from(assembled), Buffer.from(r.fileBytes)) === 0, '高速档整文件 CRC 校验一致');
 }
 
 console.log('\n== 场景 6：0 号码位持续失败（反光/遮挡）——轮换元数据防卡死 ==');
@@ -381,6 +378,17 @@ console.log('\n== 场景 6：0 号码位持续失败（反光/遮挡）——轮
   ok(assembled && Proto.crc32(assembled) === r.meta.crc32 &&
      Buffer.compare(Buffer.from(assembled), Buffer.from(r.fileBytes)) === 0, '整文件 CRC 校验一致');
   console.log(`  帧数=${r.frames}`);
+}
+
+console.log('\n== 场景 7：FEC 消除尾部拖尾（100KB + 持续失败码位） ==');
+{
+  const fileBytes = new Uint8Array(100000);
+  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 43 + 17) & 255;
+  const rFec = session(fileBytes, { maxFrames: 300, failCell: 1, fecN: Proto.FEC_DEFAULT_N });
+  const rNoFec = session(fileBytes, { maxFrames: 300, failCell: 1, fecN: 0 });
+  ok(rFec.got === rFec.meta.chunks && rFec.metaSeen, `FEC：${rFec.frames} 帧完成（无需 100% 收齐）`);
+  ok(rNoFec.got === rNoFec.meta.chunks && rNoFec.metaSeen, `无 FEC：${rNoFec.frames} 帧完成（尾部等下一轮循环补包）`);
+  console.log(`  对比：FEC ${rFec.frames} 帧 vs 无 FEC ${rNoFec.frames} 帧（大文件时差距更大——每轮循环耗时数十秒）`);
 }
 
 console.log(`\n结果：${passed} 通过, ${failed} 失败`);

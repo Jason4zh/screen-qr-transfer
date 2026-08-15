@@ -132,6 +132,12 @@ footer{margin-top:22px;text-align:center;color:#5c6485;font-size:12px;line-heigh
         </label>
       </div>
       <div class="row" style="margin-top:10px">
+        <label class="opt" style="flex-wrap:wrap">帧间隔
+          <input type="range" id="intervalSlider" min="100" max="1000" step="10" value="200" style="width:180px;vertical-align:middle">
+          <span id="intervalVal" style="min-width:130px">200ms（5.0 帧/秒）</span>
+        </label>
+      </div>
+      <div class="row" style="margin-top:10px">
         <label class="opt"><input type="checkbox" id="fullscreenChk" checked> 全屏显示</label>
         <label class="opt"><input type="checkbox" id="colorSyncChk" checked> 边框颜色逐帧变化（帧同步标识）</label>
       </div>
@@ -175,7 +181,8 @@ footer{margin-top:22px;text-align:center;color:#5c6485;font-size:12px;line-heigh
       <li><b>发送端（电脑）</b>：打开本页 → 选择文件 → 选速度档位 → 「开始发送」。屏幕全屏显示 3×2 的二维码阵列，边框颜色逐帧变化。</li>
       <li><b>接收端（手机）</b>：手机浏览器打开<b>同一页面</b>（把本文件发给手机后用浏览器打开；或电脑运行「启动局域网服务.bat」，手机访问显示的网址）→ 切到「接收端」→ 开启摄像头 → 对准电脑屏幕，等进度到 100% 后保存文件。</li>
       <li><b>对准技巧</b>：手机距屏幕 30~60cm，保持稳定，避免反光与强背光；屏幕亮度适中。绿色框=该码位正常解码，黄色=偶发失败，红色=连续失败（会自动重新定位）。</li>
-      <li><b>速度参考</b>（视设备与光线，1080p 屏）：标准 ≈15~25 KB/s、高速 ≈30~50 KB/s，约为传统「单码+黑白」方案的 10~30 倍。模块越小越快但对准要求越高，卡顿时请用标准/稳定档。</li>
+      <li><b>速度参考</b>（视设备与光线，1080p 屏）：标准 ≈15~25 KB/s、高速 ≈30~50 KB/s，约为传统「单码+黑白」方案的 10~30 倍。「帧间隔」滑杆可自定义换帧速度（越小越快，但滚动快门撕裂风险增加）。</li>
+      <li><b>防卡顿机制</b>：数据包按组生成 <b>Reed-Solomon 纠删冗余</b>（约 20%），接收端每组收齐 ~83% 即可解码，无需等 100%——彻底消除大文件「最后几个包等下一轮循环补发」造成的数十秒停顿；元数据包每 4 帧轮换码位，任何码位被遮挡/反光都能收到。</li>
       <li><b>为什么不用「逐模块彩色二维码」？</b>手机摄像头对颜色的白平衡与增益不稳定，逐模块彩色编码在真实拍摄下极易误判。本工具改为多维但可靠的方式：<b>空间维度</b>——单帧并行 6 个二维码，承载量约为单码的 6 倍；<b>时间维度</b>——流式换帧，每包独立 CRC 校验 + 乱序洗牌重发，漏帧漏码不丢数据；<b>颜色维度</b>——边框颜色仅作帧变化标识，不承载数据，因此解码稳定。</li>
       <li>文件较大时传输耗时较长，建议先压缩。本工具全程离线运行，不经过任何服务器。</li>
     </ol>

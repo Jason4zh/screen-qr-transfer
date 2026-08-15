@@ -143,6 +143,137 @@ console.log('\n== 仿射拟合（码位→位置） ==');
   ok(Proto.fitAffine([{ cell: 0, x: 1, y: 1 }, { cell: 1, x: 2, y: 1 }, { cell: 2, x: 3, y: 1 }]) === null, '共线对应点返回 null（退化）');
 }
 
+console.log('\n== Reed-Solomon FEC 纠删码 ==');
+{
+  /* GF 基础 */
+  ok(Proto.gfMul(2, 3) === 6 && Proto.gfMul(0, 7) === 0, 'GF(256) 乘法');
+  ok(Proto.gfMul(7, Proto.gfInv(7)) === 1, 'GF(256) 求逆');
+  /* 矩阵求逆 */
+  const M = [[1, 2], [3, 4]];
+  const Inv = Proto.gfMatrixInvert(M);
+  const prod = [[0, 0], [0, 0]];
+  for (let i = 0; i < 2; i++) for (let j = 0; j < 2; j++) {
+    prod[i][j] = Proto.gfMul(M[i][0], Inv[0][j]) ^ Proto.gfMul(M[i][1], Inv[1][j]);
+  }
+  ok(prod[0][0] === 1 && prod[0][1] === 0 && prod[1][0] === 0 && prod[1][1] === 1, 'GF 矩阵求逆 M×M⁻¹=I');
+  /* 小规模：N=4 K=2，穷举所有擦除组合 */
+  const N = 4, K = 2;
+  const data = [];
+  for (let i = 0; i < N; i++) {
+    const p = new Uint8Array(32);
+    for (let j = 0; j < 32; j++) p[j] = (i * 61 + j * 13 + 7) & 255;
+    data.push(p);
+  }
+  const rows = Proto.fecParityRows(N, K);
+  const parities = Proto.fecEncode(data, rows);
+  let allCombos = true;
+  for (let mask = 0; mask < 64; mask++) {
+    const present = [];
+    let cnt = 0;
+    for (let i = 0; i < N; i++) if (mask & (1 << i)) { present.push({ row: (() => { const r = new Array(N).fill(0); r[i] = 1; return r; })(), symbols: data[i] }); cnt++; }
+    for (let p = 0; p < K; p++) if (mask & (1 << (N + p))) { present.push({ row: rows[p], symbols: parities[p] }); cnt++; }
+    if (cnt < N) continue;
+    const rec = Proto.fecDecode(present, N);
+    let okc = rec != null;
+    if (okc) for (let i = 0; i < N; i++) if (Buffer.compare(Buffer.from(rec[i]), Buffer.from(data[i])) !== 0) { okc = false; break; }
+    if (!okc) { allCombos = false; break; }
+  }
+  ok(allCombos, `N=4 K=2 全部 ${1 << (N + K)} 种擦除组合可恢复`);
+  /* 大组：N=100 K=15，随机擦除 12% */
+  const N2 = 100, K2 = 15;
+  const data2 = [];
+  for (let i = 0; i < N2; i++) {
+    const p = new Uint8Array(200);
+    for (let j = 0; j < 200; j++) p[j] = (i * 31 + j * 7 + 3) & 255;
+    data2.push(p);
+  }
+  const rows2 = Proto.fecParityRows(N2, K2);
+  const parities2 = Proto.fecEncode(data2, rows2);
+  const present2 = [];
+  for (let i = 0; i < N2; i++) {
+    if (Math.random() < 0.88) {
+      const r = new Array(N2).fill(0); r[i] = 1;
+      present2.push({ row: r, symbols: data2[i] });
+    }
+  }
+  for (let p = 0; p < K2; p++) if (Math.random() < 0.88) present2.push({ row: rows2[p], symbols: parities2[p] });
+  ok(present2.length >= N2, `N=100 K=15 擦除后剩余 ${present2.length} ≥ 100`);
+  const rec2 = Proto.fecDecode(present2, N2);
+  let ok2 = rec2 != null;
+  if (ok2) for (let i = 0; i < N2; i++) if (Buffer.compare(Buffer.from(rec2[i]), Buffer.from(data2[i])) !== 0) { ok2 = false; break; }
+  ok(ok2, 'N=100 K=15 随机擦除 12% 后完整恢复');
+}
+
+console.log('\n== FEC 分包与整链路（多轮循环 + 丢包/持续失败码位） ==');
+{
+  const fileBytes = new Uint8Array(300000);
+  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 89 + 5) & 255;
+  const chunkSize = 622;
+  const fecN = 100, fecK = 0;   /* 0 → 自动 20% */
+  const { packets, meta } = Proto.packetize(fileBytes, 'fec.bin', chunkSize, fecN, fecK);
+  const info = Proto.fecBlockInfo(meta);
+  const blocks = info.blocks;
+  ok(packets.length === 1 + meta.chunks + blocks * info.K, `包数 = 元数据 + ${meta.chunks} 数据 + ${blocks}×${info.K} 奇偶（冗余 ${info.K}%）`);
+  ok(meta.fecN === fecN, '元数据携带 FEC 参数');
+
+  /* 模拟发送端循环 + 接收端分块收集：
+   * 每帧 6 个槽位，其中 1 个槽位（cell 0）持续失败 → 每轮约 1/6 包丢失 */
+  const chunks = new Array(meta.chunks);
+  const blockData = new Array(blocks), blockParity = new Array(blocks), blockHave = new Array(blocks).fill(0), blockDone = new Uint8Array(blocks);
+  for (let b = 0; b < blocks; b++) {
+    blockData[b] = new Array(info.dataCount(b)).fill(null);
+    blockParity[b] = new Array(info.K).fill(null);
+  }
+  let decoded = 0;
+  function tryDecode(b) {
+    if (blockDone[b]) return;
+    const count = info.dataCount(b);
+    const present = [];
+    for (let i = 0; i < count; i++) if (blockData[b][i]) {
+      const r = new Array(count).fill(0); r[i] = 1;
+      present.push({ row: r, symbols: blockData[b][i] });
+    }
+    const prs = Proto.fecParityRows(count, info.K);
+    for (let p2 = 0; p2 < info.K; p2++) if (blockParity[b][p2]) present.push({ row: prs[p2], symbols: blockParity[b][p2] });
+    if (present.length < count) return;
+    const rec = Proto.fecDecode(present, count);
+    if (!rec) return;
+    blockDone[b] = 1;
+    const base = b * fecN;
+    for (let i = 0; i < count; i++) if (!chunks[base + i]) { chunks[base + i] = rec[i]; decoded++; }
+  }
+  const order = [];
+  for (let i = 1; i < packets.length; i++) order.push(i);
+  let passes = 0;
+  const maxPasses = 6;
+  for (passes = 1; passes <= maxPasses && decoded < meta.chunks; passes++) {
+    for (let j = order.length - 1; j > 0; j--) { const k = (Math.random() * (j + 1)) | 0; const t = order[j]; order[j] = order[k]; order[k] = t; }
+    for (let i = 0; i < order.length; i++) {
+      if (i % 6 === 0 && Math.random() < 0.5) continue;   /* 该槽位所在 cell 半概率失败 */
+      if (Math.random() < 0.05) continue;                 /* 额外 5% 瞬态丢包 */
+      const d = Proto.decodePacket(packets[order[i]]);
+      if (!d) continue;
+      let b, pos;
+      if (!d.isParity) {
+        b = Math.floor((d.index - 1) / fecN); pos = (d.index - 1) % fecN;
+        if (blockData[b][pos]) continue;
+        blockData[b][pos] = d.payload; blockHave[b]++;
+      } else {
+        const pp = d.index - meta.chunks - 1;
+        b = Math.floor(pp / info.K); pos = pp % info.K;
+        if (blockParity[b][pos]) continue;
+        blockParity[b][pos] = d.payload; blockHave[b]++;
+      }
+      if (blockHave[b] >= info.dataCount(b)) tryDecode(b);
+    }
+  }
+  ok(decoded === meta.chunks, `持续失败码位 + 5% 瞬态丢包下，${passes} 轮内 FEC 恢复全部 ${meta.chunks} 块`);
+  ok(passes <= 3, `无需 100% 收齐：${passes} 轮即完成（无 FEC 时尾部需数十轮）`);
+  const assembled = Proto.assemble(meta, chunks);
+  ok(assembled && Proto.crc32(assembled) === meta.crc32 &&
+     Buffer.compare(Buffer.from(assembled), Buffer.from(fileBytes)) === 0, 'FEC 恢复后整文件 CRC 校验一致');
+}
+
 console.log('\n== 分包 / 组包 / 丢包 / 篡改 ==');
 {
   const fileBytes = new Uint8Array(250000);

@@ -56,10 +56,11 @@
   }
 
   /* ---------- 包编解码 ---------- */
-  /* cell：该包当前显示所在码位（0-5），发送端渲染前按槽位改写 byte[3] */
-  function encodePacket(index, total, payload, isMeta, cell) {
+  /* cell：该包当前显示所在码位（0-5），发送端渲染前按槽位改写 byte[3]
+   * flags：bit0=元数据；bit1=纠删码（FEC）奇偶包 */
+  function encodePacket(index, total, payload, isMeta, cell, isParity) {
     var out = new Uint8Array(HEADER_LEN + payload.length);
-    out[0] = MAGIC; out[1] = PROTO; out[2] = isMeta ? 1 : 0;
+    out[0] = MAGIC; out[1] = PROTO; out[2] = (isMeta ? 1 : 0) | (isParity ? 2 : 0);
     out[3] = cell || 0;
     writeU32(out, 4, index); writeU32(out, 8, total);
     writeU16(out, 12, payload.length);
@@ -78,6 +79,7 @@
     if (crc32(payload) !== readU32(bytes, 14)) return null;
     return {
       isMeta: !!(bytes[2] & 1),
+      isParity: !!(bytes[2] & 2),
       cell: bytes[3] & 255,
       index: readU32(bytes, 4),
       total: readU32(bytes, 8),
@@ -87,8 +89,15 @@
 
   /* ---------- 分包 / 组包 ----------
    * 数据包与元数据包都补齐为 chunkSize 负载（元数据以 \0 结尾）：
-   * 同屏所有二维码同一版本、同一绘制尺寸，接收端几何推导精确。 */
-  function packetize(fileBytes, name, chunkSize) {
+   * 同屏所有二维码同一版本、同一绘制尺寸，接收端几何推导精确。
+   * FEC：数据按 fecN 个一组，每组生成 fecK 个 Reed-Solomon 奇偶包；
+   * 接收端只要收齐每组 fecN 个（数据+奇偶）即可解码，无需等 100%，
+   * 彻底消除大文件“尾部拖尾”（最后几个包等下一轮循环补发导致的数十秒停顿）。 */
+  var FEC_DEFAULT_N = 100;
+
+  function packetize(fileBytes, name, chunkSize, fecN, fecK) {
+    fecN = fecN || 0;
+    fecK = fecK || 0;
     var n = fileBytes.length ? Math.ceil(fileBytes.length / chunkSize) : 0;
     var meta = {
       v: 1,
@@ -96,22 +105,158 @@
       size: fileBytes.length,
       chunks: n,
       chunkSize: chunkSize,
-      crc32: crc32(fileBytes)
+      crc32: crc32(fileBytes),
+      fecN: fecN,
+      fecK: fecK
     };
+    /* 分块信息（fecN=0 时无 FEC，blocks=0） */
+    var K = 0, blocks = 0;
+    if (fecN > 0 && n > 0) {
+      /* 冗余度按实际数据量自适应（小文件不过度冗余），默认 ~20% */
+      K = fecK > 0 ? fecK : Math.max(4, Math.min(50, Math.round(Math.min(fecN, n) * 0.2)));
+      meta.fecK = K;
+      blocks = Math.ceil(n / fecN);
+    }
+    var total = n + blocks * K;
     var metaBytes = new TextEncoder().encode(JSON.stringify(meta));
     var metaPadded = new Uint8Array(chunkSize);
     metaPadded.set(metaBytes);
     /* \0 结尾标记（JSON 字符串不会含裸 \0），接收端截取到首个 \0 */
-    var packets = [encodePacket(0, n, metaPadded, true, 0)];
+    var packets = [encodePacket(0, total, metaPadded, true, 0, false)];
+    var dataPackets = [];
     for (var i = 0; i < n; i++) {
       var start = i * chunkSize;
       var end = Math.min(start + chunkSize, fileBytes.length);
       var chunk = fileBytes.slice(start, end);
       var padded = new Uint8Array(chunkSize);
       padded.set(chunk);
-      packets.push(encodePacket(i + 1, n, padded, false, 0));
+      dataPackets.push(padded);
+      packets.push(encodePacket(i + 1, total, padded, false, 0, false));
+    }
+    /* FEC 奇偶包 */
+    if (blocks > 0) {
+      for (var b = 0; b < blocks; b++) {
+        var bStart = b * fecN;
+        var count = Math.min(fecN, n - bStart);
+        var rows = fecParityRows(count, K);
+        var parities = fecEncode(dataPackets.slice(bStart, bStart + count), rows);
+        for (var p = 0; p < K; p++) {
+          var pidx = n + b * K + p + 1;   /* 全局奇偶包序号（> chunks） */
+          packets.push(encodePacket(pidx, total, parities[p], false, 0, true));
+        }
+      }
     }
     return { packets: packets, meta: meta };
+  }
+
+  /* 由 meta 计算 FEC 分块信息 */
+  function fecBlockInfo(meta) {
+    if (!meta || !meta.fecN || meta.fecN <= 0 || meta.chunks <= 0) {
+      return { blocks: 0, K: 0, dataCount: function () { return 0; } };
+    }
+    var N = meta.fecN;
+    var K = meta.fecK > 0 ? meta.fecK : Math.max(4, Math.min(50, Math.round(N * 0.2)));
+    var blocks = Math.ceil(meta.chunks / N);
+    return {
+      blocks: blocks,
+      K: K,
+      dataCount: function (b) { return Math.min(N, meta.chunks - b * N); }
+    };
+  }
+
+  /* ---------- GF(256) 与 Reed-Solomon 纠删码 ---------- */
+  var GF_EXP = new Uint8Array(512);
+  var GF_LOG = new Uint8Array(256);
+  (function () {
+    var x = 1;
+    for (var i = 0; i < 255; i++) {
+      GF_EXP[i] = x;
+      GF_LOG[x] = i;
+      x <<= 1;
+      if (x & 0x100) x ^= 0x11D;
+    }
+    for (var i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+  })();
+  function gfMul(a, b) { return a === 0 || b === 0 ? 0 : GF_EXP[GF_LOG[a] + GF_LOG[b]]; }
+  function gfInv(a) { return GF_EXP[255 - GF_LOG[a]]; }
+
+  /* N×N 矩阵求逆（GF(256)，高斯消元） */
+  function gfMatrixInvert(M) {
+    var n = M.length;
+    var aug = [];
+    for (var i = 0; i < n; i++) {
+      var row = M[i].slice(0, n);
+      for (var j = 0; j < n; j++) row.push(i === j ? 1 : 0);
+      aug.push(row);
+    }
+    for (var col = 0; col < n; col++) {
+      var pivot = -1;
+      for (var r = col; r < n; r++) {
+        if (aug[r][col] !== 0) { pivot = r; break; }
+      }
+      if (pivot < 0) return null;
+      if (pivot !== col) { var t = aug[col]; aug[col] = aug[pivot]; aug[pivot] = t; }
+      var inv = gfInv(aug[col][col]);
+      for (var k = 0; k < 2 * n; k++) aug[col][k] = gfMul(aug[col][k], inv);
+      for (var r2 = 0; r2 < n; r2++) {
+        if (r2 === col || aug[r2][col] === 0) continue;
+        var f = aug[r2][col];
+        for (var k2 = 0; k2 < 2 * n; k2++) aug[r2][k2] = aug[r2][k2] ^ gfMul(f, aug[col][k2]);
+      }
+    }
+    return aug.map(function (row) { return row.slice(n); });
+  }
+
+  /* Vandermonde 奇偶行：第 p 行 = [1, α^p, α^{2p}, ..., α^{(N-1)p}] */
+  function fecParityRows(N, K) {
+    var rows = [];
+    for (var p = 0; p < K; p++) {
+      var row = new Array(N);
+      var v = 1;
+      var ap = GF_EXP[p];
+      for (var j = 0; j < N; j++) { row[j] = v; v = gfMul(v, ap); }
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  /* 编码：N 个等长数据包 → K 个奇偶包 */
+  function fecEncode(dataPackets, parityRows) {
+    var K = parityRows.length, N = dataPackets.length;
+    var len = dataPackets[0].length;
+    var out = [];
+    for (var p = 0; p < K; p++) {
+      var row = parityRows[p];
+      var pkt = new Uint8Array(len);
+      for (var j = 0; j < len; j++) {
+        var acc = 0;
+        for (var i = 0; i < N; i++) acc ^= gfMul(row[i], dataPackets[i][j]);
+        pkt[j] = acc;
+      }
+      out.push(pkt);
+    }
+    return out;
+  }
+
+  /* 解码：present = [{row: 该包对应的 N 维矩阵行, symbols: Uint8Array}]（≥N 个）。
+   * 返回 N 个重建的数据包。 */
+  function fecDecode(present, N) {
+    var M = [];
+    for (var i = 0; i < N; i++) M.push(present[i].row.slice(0, N));
+    var inv = gfMatrixInvert(M);
+    if (!inv) return null;
+    var len = present[0].symbols.length;
+    var out = [];
+    for (var d = 0; d < N; d++) {
+      var pkt = new Uint8Array(len);
+      for (var j = 0; j < len; j++) {
+        var acc = 0;
+        for (var r = 0; r < N; r++) acc ^= gfMul(inv[d][r], present[r].symbols[j]);
+        pkt[j] = acc;
+      }
+      out.push(pkt);
+    }
+    return out;
   }
 
   /* 解析元数据负载（截取到首个 \0） */
@@ -289,6 +434,9 @@
     MAGIC: MAGIC, PROTO: PROTO, HEADER_LEN: HEADER_LEN, CAPACITY_L: CAPACITY_L,
     crc32: crc32, encodePacket: encodePacket, decodePacket: decodePacket,
     packetize: packetize, assemble: assemble, parseMetaPayload: parseMetaPayload,
+    fecBlockInfo: fecBlockInfo, FEC_DEFAULT_N: FEC_DEFAULT_N,
+    gfMul: gfMul, gfInv: gfInv, gfMatrixInvert: gfMatrixInvert,
+    fecParityRows: fecParityRows, fecEncode: fecEncode, fecDecode: fecDecode,
     fmtBytes: fmtBytes, fmtTime: fmtTime, esc: esc,
     GRID_COLS: GRID_COLS, GRID_ROWS: GRID_ROWS, GAP_RATIO: GAP_RATIO,
     gridLayout: gridLayout, deriveGrid: deriveGrid, candidateOffsets: candidateOffsets,

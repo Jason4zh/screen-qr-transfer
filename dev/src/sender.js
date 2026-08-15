@@ -67,6 +67,16 @@
 
   Sender.isRunning = function () { return running; };
 
+  /* 自定义帧间隔（用户可覆盖档位默认值） */
+  Sender.presetInterval = function (presetName) {
+    var p = PRESETS[presetName] || PRESETS.balanced;
+    return p.holdMs;
+  };
+  Sender.setInterval = function (ms) {
+    if (ms >= 80 && ms <= 5000) cfg.holdMs = ms;
+  };
+  Sender.getInterval = function () { return cfg.holdMs; };
+
   function shuffle(a) {
     for (var i = a.length - 1; i > 0; i--) {
       var j = (Math.random() * (i + 1)) | 0;
@@ -75,27 +85,29 @@
     return a;
   }
   function buildOrder() {
-    var arr = new Array(meta.chunks);
-    for (var i = 0; i < meta.chunks; i++) arr[i] = i + 1;
+    var count = packets.length - 1;   /* 数据包 + FEC 奇偶包（不含 0 号元数据） */
+    var arr = new Array(count);
+    for (var i = 0; i < count; i++) arr[i] = i + 1;
     order = shuffle(arr); pos = 0;
   }
 
   /* 每帧挑选一窗口的包；元数据每 4 帧出现一次，并轮换到不同码位
    * （没有任何码位被独占 → 即使某个码位持续失败，元数据也会经由其他
    * 码位到达，杜绝“数据收齐却因缺元数据而卡死”）；
-   * 数据队列耗尽即重建（小文件也会循环重发全部数据包）；
-   * 小文件（数据包不足 6 个）时剩余槽位用元数据填充：所有码位都有内容 */
+   * 数据/奇偶队列耗尽即重建（循环重发，配合 FEC 无需 100% 收齐）；
+   * 小文件（包数不足 6 个）时剩余槽位用元数据填充：所有码位都有内容 */
   function nextFramePacketIndexes() {
     var n = cfg.cols * cfg.rows;
+    var maxIdx = packets.length - 1;
     var out = new Array(n).fill(null);
     if (meta && n > 0 && frameNo % 4 === 0) {
       out[Math.floor(frameNo / 4) % n] = 0;   /* 元数据轮换码位 */
     }
     for (var i = 0; i < n; i++) {
       if (out[i] !== null) continue;
-      if (!meta || meta.chunks === 0) continue;
-      if (order.length === 0 || pos >= meta.chunks) buildOrder();   /* 队列为空或耗尽：重建（重新洗牌）继续重发 */
-      if (pos < meta.chunks) { out[i] = order[pos++]; }
+      if (maxIdx <= 0) continue;
+      if (order.length === 0 || pos >= maxIdx) buildOrder();   /* 队列为空或耗尽：重建（重新洗牌）继续重发 */
+      if (pos < maxIdx) { out[i] = order[pos++]; }
       else { out[i] = 0; }                    /* 兜底：剩余槽位填元数据 */
     }
     slotsSent += n;
@@ -201,7 +213,7 @@
     var sec = (performance.now() - startTs) / 1000;
     var fps = sec > 0 ? shownFrames / sec : 0;
     var pass = 1;
-    if (meta && meta.chunks > 0) pass = Math.floor(slotsSent / meta.chunks) + 1;
+    if (packets.length > 1) pass = Math.floor(slotsSent / (packets.length - 1)) + 1;
     var perFrame = QRProtocol.fmtBytes(chunkSize * cfg.cols * cfg.rows);
     el.innerHTML = '已播 <b>' + shownFrames + '</b> 帧 · ' + fps.toFixed(1) + ' FPS · 第 ' + pass + ' 轮 · 单帧约 ' + perFrame +
       '<br><span class="dim">单向传输：手机端接收完成后，请点「⏹ 停止」</span>';
@@ -228,7 +240,7 @@
     if (!fileBytes) { global.UI && UI.toast('请先选择文件'); return; }
     ensureCanvas();
     chunkSize = computeChunkSize(canvas.width, canvas.height);
-    var res = QRProtocol.packetize(fileBytes, fileName, chunkSize);
+    var res = QRProtocol.packetize(fileBytes, fileName, chunkSize, QRProtocol.FEC_DEFAULT_N, 0);
     packets = res.packets; meta = res.meta;
     frameNo = 0; order = []; pos = 0; slotsSent = 0; shownFrames = 0;
     startTs = performance.now();

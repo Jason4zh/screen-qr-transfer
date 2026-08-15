@@ -15,9 +15,13 @@
   var stream = null, running = false, timer = null;
   var regions = [];                   /* {x,y,w,h,fails,ok} */
   var needRelocate = true, lastRelocate = 0, failStreak = 0;
-  var meta = null, chunks = null, received = null, gotCount = 0;
+  var meta = null, chunks = null, gotCount = 0;
   var lastTotal = 0;               /* 未收到元数据时，用包头 total 显示进度 */
   var speedWindow = [];
+  /* FEC 分块状态 */
+  var blockInfo = null, blockHave = null, blockData = null, blockParity = null, blockDone = null;
+  var pendingPackets = [];         /* 元数据到达前的包先缓冲 */
+  var preMetaSeen = null, preMetaCount = 0;
   var stats = { fps: 0, ticks: 0, last: 0 };
   var resultBytes = null, resultName = '';
 
@@ -69,7 +73,9 @@
   };
 
   function resetReceive() {
-    meta = null; chunks = null; received = null; gotCount = 0;
+    meta = null; chunks = null; gotCount = 0;
+    blockInfo = null; blockHave = null; blockData = null; blockParity = null; blockDone = null;
+    pendingPackets = []; preMetaSeen = null; preMetaCount = 0;
     speedWindow = []; resultBytes = null; resultName = '';
     $('progressWrap').style.display = 'none';
     $('btnDownload').style.display = 'none';
@@ -312,43 +318,125 @@
         var m = QRProtocol.parseMetaPayload(pkt.payload);
         if (m && m.v === 1 && typeof m.size === 'number' && m.chunks >= 0 && m.chunkSize > 0) {
           if (!meta || m.size !== meta.size || m.chunks !== meta.chunks) {
-            /* 保留元数据到达前已收到的数据包（按索引回填） */
-            var oldChunks = chunks, oldGot = gotCount;
             meta = m;
-            chunks = new Array(m.chunks);
-            received = new Uint8Array(m.chunks + 1);
-            gotCount = 0;
-            if (oldChunks && oldChunks.length === m.chunks) {
-              for (var i = 0; i < oldChunks.length; i++) {
-                if (oldChunks[i]) { chunks[i] = oldChunks[i]; received[i + 1] = 1; gotCount++; }
-              }
-            }
-            speedWindow = [];
-            if (gotCount === meta.chunks) finish();
+            initBlocks();
+            /* 回放元数据前缓冲的包 */
+            var pend = pendingPackets;
+            pendingPackets = [];
+            for (var i = 0; i < pend.length; i++) collectPacket(pend[i]);
           }
           if (m.chunks === 0) finish();
         }
       } catch (e) { console.error(e); }
       return;
     }
-    lastTotal = pkt.total;   /* 元数据到达前即可估算总包数 */
-    if (meta) {
-      if (pkt.index < 1 || pkt.index > meta.chunks) return;
-      if (received[pkt.index]) return;
-      received[pkt.index] = 1; gotCount++;
-      chunks[pkt.index - 1] = pkt.payload;
-    } else {
-      /* 元数据未到：先记账，等元数据到达后统一回填 */
-      if (!received) { received = new Uint8Array(pkt.total + 1); chunks = new Array(pkt.total); }
-      if (pkt.index >= 1 && pkt.index <= pkt.total && !received[pkt.index]) {
-        received[pkt.index] = 1; gotCount++;
+    lastTotal = pkt.total;
+    if (!meta) {
+      /* 元数据未到：先缓冲 + 记账显示进度 */
+      if (!preMetaSeen || preMetaSeen.length < pkt.total + 1) {
+        preMetaSeen = new Uint8Array(pkt.total + 1);
+        preMetaCount = 0;
+      }
+      if (pkt.index >= 1 && pkt.index <= pkt.total && !preMetaSeen[pkt.index]) {
+        preMetaSeen[pkt.index] = 1;
+        preMetaCount++;
+      }
+      pendingPackets.push(pkt);
+      return;
+    }
+    collectPacket(pkt);
+  }
+
+  /* 初始化 FEC 分块 */
+  function initBlocks() {
+    chunks = new Array(meta.chunks);
+    gotCount = 0;
+    blockInfo = QRProtocol.fecBlockInfo(meta);
+    var blocks = Math.max(1, blockInfo.blocks);
+    blockHave = new Array(blocks).fill(0);
+    blockDone = new Uint8Array(blocks);
+    blockData = new Array(blocks);
+    blockParity = new Array(blocks);
+    for (var b = 0; b < blocks; b++) {
+      var dc = blockInfo.dataCount(b);
+      blockData[b] = dc ? new Array(dc).fill(null) : [];
+      blockParity[b] = blockInfo.K ? new Array(blockInfo.K).fill(null) : [];
+    }
+  }
+
+  function collectPacket(pkt) {
+    if (blockInfo.blocks === 0) {
+      /* 无 FEC：每个数据包即一个单位 */
+      if (pkt.isParity) return;
+      if (pkt.index >= 1 && pkt.index <= meta.chunks && !chunks[pkt.index - 1]) {
         chunks[pkt.index - 1] = pkt.payload;
+        gotCount++;
+        bumpSpeed(pkt.payload.length);
+        if (gotCount === meta.chunks) finish();
+      }
+      return;
+    }
+    if (pkt.index < 1 || pkt.index > pkt.total) return;
+    var b, pos;
+    if (!pkt.isParity) {
+      b = Math.floor((pkt.index - 1) / meta.fecN);
+      pos = (pkt.index - 1) % meta.fecN;
+      if (b >= blockData.length || !blockData[b] || pos >= blockData[b].length) return;
+      if (blockData[b][pos]) return;
+      blockData[b][pos] = pkt.payload;
+      blockHave[b]++;
+    } else {
+      var pp = pkt.index - meta.chunks - 1;
+      if (pp < 0 || blockInfo.K <= 0) return;
+      b = Math.floor(pp / blockInfo.K);
+      pos = pp % blockInfo.K;
+      if (b >= blockParity.length || !blockParity[b] || pos >= blockParity[b].length) return;
+      if (blockParity[b][pos]) return;
+      blockParity[b][pos] = pkt.payload;
+      blockHave[b]++;
+    }
+    if (blockHave[b] >= blockInfo.dataCount(b)) tryDecodeBlock(b);
+  }
+
+  /* FEC 解码：该组收齐 fecN 个（数据+奇偶）即可重建全部数据包 */
+  function tryDecodeBlock(b) {
+    if (blockDone[b]) return;
+    var count = blockInfo.dataCount(b);
+    var present = [];
+    for (var i = 0; i < count; i++) {
+      if (blockData[b][i]) {
+        var row = new Array(count).fill(0);
+        row[i] = 1;
+        present.push({ row: row, symbols: blockData[b][i] });
       }
     }
+    var rows = blockInfo.K ? QRProtocol.fecParityRows(count, blockInfo.K) : [];
+    for (var p = 0; p < blockInfo.K; p++) {
+      if (blockParity[b][p]) present.push({ row: rows[p], symbols: blockParity[b][p] });
+    }
+    if (present.length < count) return;
+    var recovered = QRProtocol.fecDecode(present, count);
+    if (!recovered) return;
+    blockDone[b] = 1;
+    var base = b * meta.fecN;
+    var gained = 0;
+    for (var i2 = 0; i2 < count; i2++) {
+      if (!chunks[base + i2]) {
+        chunks[base + i2] = recovered[i2];
+        gotCount++;
+        gained++;
+      }
+    }
+    blockData[b] = null;
+    blockParity[b] = null;   /* 释放内存 */
+    if (gained > 0) bumpSpeed(gained * meta.chunkSize);
+    if (gotCount === meta.chunks) finish();
+  }
+
+  function bumpSpeed(bytes) {
     var now = performance.now();
-    speedWindow.push({ t: now, b: pkt.payload.length });
+    speedWindow.push({ t: now, b: bytes });
     while (speedWindow.length && now - speedWindow[0].t > 5000) speedWindow.shift();
-    if (meta && gotCount === meta.chunks) finish();
   }
 
   function finish() {
@@ -421,14 +509,14 @@
       $('progressText').textContent = QRProtocol.fmtBytes(gotB) + ' / ' + QRProtocol.fmtBytes(meta.size) +
         ' · ' + (pct * 100).toFixed(1) + '% · 解码 ' + stats.fps + ' FPS' + eta;
       setStatus('接收中：' + (meta.name || '') + '（' + QRProtocol.fmtBytes(meta.size) + '）');
-    } else if (!meta && gotCount > 0 && lastTotal > 0) {
+    } else if (!meta && preMetaCount > 0 && lastTotal > 0) {
       /* 元数据未到：用包头 total 估算进度 */
-      var p2 = Math.min(100, gotCount / lastTotal * 100);
+      var p2 = Math.min(100, preMetaCount / lastTotal * 100);
       $('progressWrap').style.display = 'block';
       $('progressFill').style.width = p2.toFixed(1) + '%';
-      $('progressText').textContent = '已接收 ' + gotCount + ' / ' + lastTotal + ' 包 · ' +
+      $('progressText').textContent = '已接收 ' + preMetaCount + ' / ' + lastTotal + ' 包 · ' +
         p2.toFixed(1) + '% · 解码 ' + stats.fps + ' FPS（等待文件信息…）';
-      setStatus('接收中：已锁定 ' + regions.length + ' 个码位（' + gotCount + '/' + lastTotal + ' 包）');
+      setStatus('接收中：已锁定 ' + regions.length + ' 个码位（' + preMetaCount + '/' + lastTotal + ' 包）');
     } else if (!meta) {
       $('progressWrap').style.display = 'none';
     }

@@ -132,6 +132,12 @@ footer{margin-top:22px;text-align:center;color:#5c6485;font-size:12px;line-heigh
         </label>
       </div>
       <div class="row" style="margin-top:10px">
+        <label class="opt" style="flex-wrap:wrap">帧间隔
+          <input type="range" id="intervalSlider" min="100" max="1000" step="10" value="200" style="width:180px;vertical-align:middle">
+          <span id="intervalVal" style="min-width:130px">200ms（5.0 帧/秒）</span>
+        </label>
+      </div>
+      <div class="row" style="margin-top:10px">
         <label class="opt"><input type="checkbox" id="fullscreenChk" checked> 全屏显示</label>
         <label class="opt"><input type="checkbox" id="colorSyncChk" checked> 边框颜色逐帧变化（帧同步标识）</label>
       </div>
@@ -175,7 +181,8 @@ footer{margin-top:22px;text-align:center;color:#5c6485;font-size:12px;line-heigh
       <li><b>发送端（电脑）</b>：打开本页 → 选择文件 → 选速度档位 → 「开始发送」。屏幕全屏显示 3×2 的二维码阵列，边框颜色逐帧变化。</li>
       <li><b>接收端（手机）</b>：手机浏览器打开<b>同一页面</b>（把本文件发给手机后用浏览器打开；或电脑运行「启动局域网服务.bat」，手机访问显示的网址）→ 切到「接收端」→ 开启摄像头 → 对准电脑屏幕，等进度到 100% 后保存文件。</li>
       <li><b>对准技巧</b>：手机距屏幕 30~60cm，保持稳定，避免反光与强背光；屏幕亮度适中。绿色框=该码位正常解码，黄色=偶发失败，红色=连续失败（会自动重新定位）。</li>
-      <li><b>速度参考</b>（视设备与光线，1080p 屏）：标准 ≈15~25 KB/s、高速 ≈30~50 KB/s，约为传统「单码+黑白」方案的 10~30 倍。模块越小越快但对准要求越高，卡顿时请用标准/稳定档。</li>
+      <li><b>速度参考</b>（视设备与光线，1080p 屏）：标准 ≈15~25 KB/s、高速 ≈30~50 KB/s，约为传统「单码+黑白」方案的 10~30 倍。「帧间隔」滑杆可自定义换帧速度（越小越快，但滚动快门撕裂风险增加）。</li>
+      <li><b>防卡顿机制</b>：数据包按组生成 <b>Reed-Solomon 纠删冗余</b>（约 20%），接收端每组收齐 ~83% 即可解码，无需等 100%——彻底消除大文件「最后几个包等下一轮循环补发」造成的数十秒停顿；元数据包每 4 帧轮换码位，任何码位被遮挡/反光都能收到。</li>
       <li><b>为什么不用「逐模块彩色二维码」？</b>手机摄像头对颜色的白平衡与增益不稳定，逐模块彩色编码在真实拍摄下极易误判。本工具改为多维但可靠的方式：<b>空间维度</b>——单帧并行 6 个二维码，承载量约为单码的 6 倍；<b>时间维度</b>——流式换帧，每包独立 CRC 校验 + 乱序洗牌重发，漏帧漏码不丢数据；<b>颜色维度</b>——边框颜色仅作帧变化标识，不承载数据，因此解码稳定。</li>
       <li>文件较大时传输耗时较长，建议先压缩。本工具全程离线运行，不经过任何服务器。</li>
     </ol>
@@ -12668,10 +12675,11 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   }
 
   /* ---------- 包编解码 ---------- */
-  /* cell：该包当前显示所在码位（0-5），发送端渲染前按槽位改写 byte[3] */
-  function encodePacket(index, total, payload, isMeta, cell) {
+  /* cell：该包当前显示所在码位（0-5），发送端渲染前按槽位改写 byte[3]
+   * flags：bit0=元数据；bit1=纠删码（FEC）奇偶包 */
+  function encodePacket(index, total, payload, isMeta, cell, isParity) {
     var out = new Uint8Array(HEADER_LEN + payload.length);
-    out[0] = MAGIC; out[1] = PROTO; out[2] = isMeta ? 1 : 0;
+    out[0] = MAGIC; out[1] = PROTO; out[2] = (isMeta ? 1 : 0) | (isParity ? 2 : 0);
     out[3] = cell || 0;
     writeU32(out, 4, index); writeU32(out, 8, total);
     writeU16(out, 12, payload.length);
@@ -12690,6 +12698,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     if (crc32(payload) !== readU32(bytes, 14)) return null;
     return {
       isMeta: !!(bytes[2] & 1),
+      isParity: !!(bytes[2] & 2),
       cell: bytes[3] & 255,
       index: readU32(bytes, 4),
       total: readU32(bytes, 8),
@@ -12699,8 +12708,15 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
   /* ---------- 分包 / 组包 ----------
    * 数据包与元数据包都补齐为 chunkSize 负载（元数据以 \0 结尾）：
-   * 同屏所有二维码同一版本、同一绘制尺寸，接收端几何推导精确。 */
-  function packetize(fileBytes, name, chunkSize) {
+   * 同屏所有二维码同一版本、同一绘制尺寸，接收端几何推导精确。
+   * FEC：数据按 fecN 个一组，每组生成 fecK 个 Reed-Solomon 奇偶包；
+   * 接收端只要收齐每组 fecN 个（数据+奇偶）即可解码，无需等 100%，
+   * 彻底消除大文件“尾部拖尾”（最后几个包等下一轮循环补发导致的数十秒停顿）。 */
+  var FEC_DEFAULT_N = 100;
+
+  function packetize(fileBytes, name, chunkSize, fecN, fecK) {
+    fecN = fecN || 0;
+    fecK = fecK || 0;
     var n = fileBytes.length ? Math.ceil(fileBytes.length / chunkSize) : 0;
     var meta = {
       v: 1,
@@ -12708,22 +12724,158 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       size: fileBytes.length,
       chunks: n,
       chunkSize: chunkSize,
-      crc32: crc32(fileBytes)
+      crc32: crc32(fileBytes),
+      fecN: fecN,
+      fecK: fecK
     };
+    /* 分块信息（fecN=0 时无 FEC，blocks=0） */
+    var K = 0, blocks = 0;
+    if (fecN > 0 && n > 0) {
+      /* 冗余度按实际数据量自适应（小文件不过度冗余），默认 ~20% */
+      K = fecK > 0 ? fecK : Math.max(4, Math.min(50, Math.round(Math.min(fecN, n) * 0.2)));
+      meta.fecK = K;
+      blocks = Math.ceil(n / fecN);
+    }
+    var total = n + blocks * K;
     var metaBytes = new TextEncoder().encode(JSON.stringify(meta));
     var metaPadded = new Uint8Array(chunkSize);
     metaPadded.set(metaBytes);
     /* \0 结尾标记（JSON 字符串不会含裸 \0），接收端截取到首个 \0 */
-    var packets = [encodePacket(0, n, metaPadded, true, 0)];
+    var packets = [encodePacket(0, total, metaPadded, true, 0, false)];
+    var dataPackets = [];
     for (var i = 0; i < n; i++) {
       var start = i * chunkSize;
       var end = Math.min(start + chunkSize, fileBytes.length);
       var chunk = fileBytes.slice(start, end);
       var padded = new Uint8Array(chunkSize);
       padded.set(chunk);
-      packets.push(encodePacket(i + 1, n, padded, false, 0));
+      dataPackets.push(padded);
+      packets.push(encodePacket(i + 1, total, padded, false, 0, false));
+    }
+    /* FEC 奇偶包 */
+    if (blocks > 0) {
+      for (var b = 0; b < blocks; b++) {
+        var bStart = b * fecN;
+        var count = Math.min(fecN, n - bStart);
+        var rows = fecParityRows(count, K);
+        var parities = fecEncode(dataPackets.slice(bStart, bStart + count), rows);
+        for (var p = 0; p < K; p++) {
+          var pidx = n + b * K + p + 1;   /* 全局奇偶包序号（> chunks） */
+          packets.push(encodePacket(pidx, total, parities[p], false, 0, true));
+        }
+      }
     }
     return { packets: packets, meta: meta };
+  }
+
+  /* 由 meta 计算 FEC 分块信息 */
+  function fecBlockInfo(meta) {
+    if (!meta || !meta.fecN || meta.fecN <= 0 || meta.chunks <= 0) {
+      return { blocks: 0, K: 0, dataCount: function () { return 0; } };
+    }
+    var N = meta.fecN;
+    var K = meta.fecK > 0 ? meta.fecK : Math.max(4, Math.min(50, Math.round(N * 0.2)));
+    var blocks = Math.ceil(meta.chunks / N);
+    return {
+      blocks: blocks,
+      K: K,
+      dataCount: function (b) { return Math.min(N, meta.chunks - b * N); }
+    };
+  }
+
+  /* ---------- GF(256) 与 Reed-Solomon 纠删码 ---------- */
+  var GF_EXP = new Uint8Array(512);
+  var GF_LOG = new Uint8Array(256);
+  (function () {
+    var x = 1;
+    for (var i = 0; i < 255; i++) {
+      GF_EXP[i] = x;
+      GF_LOG[x] = i;
+      x <<= 1;
+      if (x & 0x100) x ^= 0x11D;
+    }
+    for (var i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+  })();
+  function gfMul(a, b) { return a === 0 || b === 0 ? 0 : GF_EXP[GF_LOG[a] + GF_LOG[b]]; }
+  function gfInv(a) { return GF_EXP[255 - GF_LOG[a]]; }
+
+  /* N×N 矩阵求逆（GF(256)，高斯消元） */
+  function gfMatrixInvert(M) {
+    var n = M.length;
+    var aug = [];
+    for (var i = 0; i < n; i++) {
+      var row = M[i].slice(0, n);
+      for (var j = 0; j < n; j++) row.push(i === j ? 1 : 0);
+      aug.push(row);
+    }
+    for (var col = 0; col < n; col++) {
+      var pivot = -1;
+      for (var r = col; r < n; r++) {
+        if (aug[r][col] !== 0) { pivot = r; break; }
+      }
+      if (pivot < 0) return null;
+      if (pivot !== col) { var t = aug[col]; aug[col] = aug[pivot]; aug[pivot] = t; }
+      var inv = gfInv(aug[col][col]);
+      for (var k = 0; k < 2 * n; k++) aug[col][k] = gfMul(aug[col][k], inv);
+      for (var r2 = 0; r2 < n; r2++) {
+        if (r2 === col || aug[r2][col] === 0) continue;
+        var f = aug[r2][col];
+        for (var k2 = 0; k2 < 2 * n; k2++) aug[r2][k2] = aug[r2][k2] ^ gfMul(f, aug[col][k2]);
+      }
+    }
+    return aug.map(function (row) { return row.slice(n); });
+  }
+
+  /* Vandermonde 奇偶行：第 p 行 = [1, α^p, α^{2p}, ..., α^{(N-1)p}] */
+  function fecParityRows(N, K) {
+    var rows = [];
+    for (var p = 0; p < K; p++) {
+      var row = new Array(N);
+      var v = 1;
+      var ap = GF_EXP[p];
+      for (var j = 0; j < N; j++) { row[j] = v; v = gfMul(v, ap); }
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  /* 编码：N 个等长数据包 → K 个奇偶包 */
+  function fecEncode(dataPackets, parityRows) {
+    var K = parityRows.length, N = dataPackets.length;
+    var len = dataPackets[0].length;
+    var out = [];
+    for (var p = 0; p < K; p++) {
+      var row = parityRows[p];
+      var pkt = new Uint8Array(len);
+      for (var j = 0; j < len; j++) {
+        var acc = 0;
+        for (var i = 0; i < N; i++) acc ^= gfMul(row[i], dataPackets[i][j]);
+        pkt[j] = acc;
+      }
+      out.push(pkt);
+    }
+    return out;
+  }
+
+  /* 解码：present = [{row: 该包对应的 N 维矩阵行, symbols: Uint8Array}]（≥N 个）。
+   * 返回 N 个重建的数据包。 */
+  function fecDecode(present, N) {
+    var M = [];
+    for (var i = 0; i < N; i++) M.push(present[i].row.slice(0, N));
+    var inv = gfMatrixInvert(M);
+    if (!inv) return null;
+    var len = present[0].symbols.length;
+    var out = [];
+    for (var d = 0; d < N; d++) {
+      var pkt = new Uint8Array(len);
+      for (var j = 0; j < len; j++) {
+        var acc = 0;
+        for (var r = 0; r < N; r++) acc ^= gfMul(inv[d][r], present[r].symbols[j]);
+        pkt[j] = acc;
+      }
+      out.push(pkt);
+    }
+    return out;
   }
 
   /* 解析元数据负载（截取到首个 \0） */
@@ -12901,6 +13053,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     MAGIC: MAGIC, PROTO: PROTO, HEADER_LEN: HEADER_LEN, CAPACITY_L: CAPACITY_L,
     crc32: crc32, encodePacket: encodePacket, decodePacket: decodePacket,
     packetize: packetize, assemble: assemble, parseMetaPayload: parseMetaPayload,
+    fecBlockInfo: fecBlockInfo, FEC_DEFAULT_N: FEC_DEFAULT_N,
+    gfMul: gfMul, gfInv: gfInv, gfMatrixInvert: gfMatrixInvert,
+    fecParityRows: fecParityRows, fecEncode: fecEncode, fecDecode: fecDecode,
     fmtBytes: fmtBytes, fmtTime: fmtTime, esc: esc,
     GRID_COLS: GRID_COLS, GRID_ROWS: GRID_ROWS, GAP_RATIO: GAP_RATIO,
     gridLayout: gridLayout, deriveGrid: deriveGrid, candidateOffsets: candidateOffsets,
@@ -12980,6 +13135,16 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
 
   Sender.isRunning = function () { return running; };
 
+  /* 自定义帧间隔（用户可覆盖档位默认值） */
+  Sender.presetInterval = function (presetName) {
+    var p = PRESETS[presetName] || PRESETS.balanced;
+    return p.holdMs;
+  };
+  Sender.setInterval = function (ms) {
+    if (ms >= 80 && ms <= 5000) cfg.holdMs = ms;
+  };
+  Sender.getInterval = function () { return cfg.holdMs; };
+
   function shuffle(a) {
     for (var i = a.length - 1; i > 0; i--) {
       var j = (Math.random() * (i + 1)) | 0;
@@ -12988,27 +13153,29 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     return a;
   }
   function buildOrder() {
-    var arr = new Array(meta.chunks);
-    for (var i = 0; i < meta.chunks; i++) arr[i] = i + 1;
+    var count = packets.length - 1;   /* 数据包 + FEC 奇偶包（不含 0 号元数据） */
+    var arr = new Array(count);
+    for (var i = 0; i < count; i++) arr[i] = i + 1;
     order = shuffle(arr); pos = 0;
   }
 
   /* 每帧挑选一窗口的包；元数据每 4 帧出现一次，并轮换到不同码位
    * （没有任何码位被独占 → 即使某个码位持续失败，元数据也会经由其他
    * 码位到达，杜绝“数据收齐却因缺元数据而卡死”）；
-   * 数据队列耗尽即重建（小文件也会循环重发全部数据包）；
-   * 小文件（数据包不足 6 个）时剩余槽位用元数据填充：所有码位都有内容 */
+   * 数据/奇偶队列耗尽即重建（循环重发，配合 FEC 无需 100% 收齐）；
+   * 小文件（包数不足 6 个）时剩余槽位用元数据填充：所有码位都有内容 */
   function nextFramePacketIndexes() {
     var n = cfg.cols * cfg.rows;
+    var maxIdx = packets.length - 1;
     var out = new Array(n).fill(null);
     if (meta && n > 0 && frameNo % 4 === 0) {
       out[Math.floor(frameNo / 4) % n] = 0;   /* 元数据轮换码位 */
     }
     for (var i = 0; i < n; i++) {
       if (out[i] !== null) continue;
-      if (!meta || meta.chunks === 0) continue;
-      if (order.length === 0 || pos >= meta.chunks) buildOrder();   /* 队列为空或耗尽：重建（重新洗牌）继续重发 */
-      if (pos < meta.chunks) { out[i] = order[pos++]; }
+      if (maxIdx <= 0) continue;
+      if (order.length === 0 || pos >= maxIdx) buildOrder();   /* 队列为空或耗尽：重建（重新洗牌）继续重发 */
+      if (pos < maxIdx) { out[i] = order[pos++]; }
       else { out[i] = 0; }                    /* 兜底：剩余槽位填元数据 */
     }
     slotsSent += n;
@@ -13114,7 +13281,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     var sec = (performance.now() - startTs) / 1000;
     var fps = sec > 0 ? shownFrames / sec : 0;
     var pass = 1;
-    if (meta && meta.chunks > 0) pass = Math.floor(slotsSent / meta.chunks) + 1;
+    if (packets.length > 1) pass = Math.floor(slotsSent / (packets.length - 1)) + 1;
     var perFrame = QRProtocol.fmtBytes(chunkSize * cfg.cols * cfg.rows);
     el.innerHTML = '已播 <b>' + shownFrames + '</b> 帧 · ' + fps.toFixed(1) + ' FPS · 第 ' + pass + ' 轮 · 单帧约 ' + perFrame +
       '<br><span class="dim">单向传输：手机端接收完成后，请点「⏹ 停止」</span>';
@@ -13141,7 +13308,7 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     if (!fileBytes) { global.UI && UI.toast('请先选择文件'); return; }
     ensureCanvas();
     chunkSize = computeChunkSize(canvas.width, canvas.height);
-    var res = QRProtocol.packetize(fileBytes, fileName, chunkSize);
+    var res = QRProtocol.packetize(fileBytes, fileName, chunkSize, QRProtocol.FEC_DEFAULT_N, 0);
     packets = res.packets; meta = res.meta;
     frameNo = 0; order = []; pos = 0; slotsSent = 0; shownFrames = 0;
     startTs = performance.now();
@@ -13203,9 +13370,13 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   var stream = null, running = false, timer = null;
   var regions = [];                   /* {x,y,w,h,fails,ok} */
   var needRelocate = true, lastRelocate = 0, failStreak = 0;
-  var meta = null, chunks = null, received = null, gotCount = 0;
+  var meta = null, chunks = null, gotCount = 0;
   var lastTotal = 0;               /* 未收到元数据时，用包头 total 显示进度 */
   var speedWindow = [];
+  /* FEC 分块状态 */
+  var blockInfo = null, blockHave = null, blockData = null, blockParity = null, blockDone = null;
+  var pendingPackets = [];         /* 元数据到达前的包先缓冲 */
+  var preMetaSeen = null, preMetaCount = 0;
   var stats = { fps: 0, ticks: 0, last: 0 };
   var resultBytes = null, resultName = '';
 
@@ -13257,7 +13428,9 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   };
 
   function resetReceive() {
-    meta = null; chunks = null; received = null; gotCount = 0;
+    meta = null; chunks = null; gotCount = 0;
+    blockInfo = null; blockHave = null; blockData = null; blockParity = null; blockDone = null;
+    pendingPackets = []; preMetaSeen = null; preMetaCount = 0;
     speedWindow = []; resultBytes = null; resultName = '';
     $('progressWrap').style.display = 'none';
     $('btnDownload').style.display = 'none';
@@ -13500,43 +13673,125 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
         var m = QRProtocol.parseMetaPayload(pkt.payload);
         if (m && m.v === 1 && typeof m.size === 'number' && m.chunks >= 0 && m.chunkSize > 0) {
           if (!meta || m.size !== meta.size || m.chunks !== meta.chunks) {
-            /* 保留元数据到达前已收到的数据包（按索引回填） */
-            var oldChunks = chunks, oldGot = gotCount;
             meta = m;
-            chunks = new Array(m.chunks);
-            received = new Uint8Array(m.chunks + 1);
-            gotCount = 0;
-            if (oldChunks && oldChunks.length === m.chunks) {
-              for (var i = 0; i < oldChunks.length; i++) {
-                if (oldChunks[i]) { chunks[i] = oldChunks[i]; received[i + 1] = 1; gotCount++; }
-              }
-            }
-            speedWindow = [];
-            if (gotCount === meta.chunks) finish();
+            initBlocks();
+            /* 回放元数据前缓冲的包 */
+            var pend = pendingPackets;
+            pendingPackets = [];
+            for (var i = 0; i < pend.length; i++) collectPacket(pend[i]);
           }
           if (m.chunks === 0) finish();
         }
       } catch (e) { console.error(e); }
       return;
     }
-    lastTotal = pkt.total;   /* 元数据到达前即可估算总包数 */
-    if (meta) {
-      if (pkt.index < 1 || pkt.index > meta.chunks) return;
-      if (received[pkt.index]) return;
-      received[pkt.index] = 1; gotCount++;
-      chunks[pkt.index - 1] = pkt.payload;
-    } else {
-      /* 元数据未到：先记账，等元数据到达后统一回填 */
-      if (!received) { received = new Uint8Array(pkt.total + 1); chunks = new Array(pkt.total); }
-      if (pkt.index >= 1 && pkt.index <= pkt.total && !received[pkt.index]) {
-        received[pkt.index] = 1; gotCount++;
+    lastTotal = pkt.total;
+    if (!meta) {
+      /* 元数据未到：先缓冲 + 记账显示进度 */
+      if (!preMetaSeen || preMetaSeen.length < pkt.total + 1) {
+        preMetaSeen = new Uint8Array(pkt.total + 1);
+        preMetaCount = 0;
+      }
+      if (pkt.index >= 1 && pkt.index <= pkt.total && !preMetaSeen[pkt.index]) {
+        preMetaSeen[pkt.index] = 1;
+        preMetaCount++;
+      }
+      pendingPackets.push(pkt);
+      return;
+    }
+    collectPacket(pkt);
+  }
+
+  /* 初始化 FEC 分块 */
+  function initBlocks() {
+    chunks = new Array(meta.chunks);
+    gotCount = 0;
+    blockInfo = QRProtocol.fecBlockInfo(meta);
+    var blocks = Math.max(1, blockInfo.blocks);
+    blockHave = new Array(blocks).fill(0);
+    blockDone = new Uint8Array(blocks);
+    blockData = new Array(blocks);
+    blockParity = new Array(blocks);
+    for (var b = 0; b < blocks; b++) {
+      var dc = blockInfo.dataCount(b);
+      blockData[b] = dc ? new Array(dc).fill(null) : [];
+      blockParity[b] = blockInfo.K ? new Array(blockInfo.K).fill(null) : [];
+    }
+  }
+
+  function collectPacket(pkt) {
+    if (blockInfo.blocks === 0) {
+      /* 无 FEC：每个数据包即一个单位 */
+      if (pkt.isParity) return;
+      if (pkt.index >= 1 && pkt.index <= meta.chunks && !chunks[pkt.index - 1]) {
         chunks[pkt.index - 1] = pkt.payload;
+        gotCount++;
+        bumpSpeed(pkt.payload.length);
+        if (gotCount === meta.chunks) finish();
+      }
+      return;
+    }
+    if (pkt.index < 1 || pkt.index > pkt.total) return;
+    var b, pos;
+    if (!pkt.isParity) {
+      b = Math.floor((pkt.index - 1) / meta.fecN);
+      pos = (pkt.index - 1) % meta.fecN;
+      if (b >= blockData.length || !blockData[b] || pos >= blockData[b].length) return;
+      if (blockData[b][pos]) return;
+      blockData[b][pos] = pkt.payload;
+      blockHave[b]++;
+    } else {
+      var pp = pkt.index - meta.chunks - 1;
+      if (pp < 0 || blockInfo.K <= 0) return;
+      b = Math.floor(pp / blockInfo.K);
+      pos = pp % blockInfo.K;
+      if (b >= blockParity.length || !blockParity[b] || pos >= blockParity[b].length) return;
+      if (blockParity[b][pos]) return;
+      blockParity[b][pos] = pkt.payload;
+      blockHave[b]++;
+    }
+    if (blockHave[b] >= blockInfo.dataCount(b)) tryDecodeBlock(b);
+  }
+
+  /* FEC 解码：该组收齐 fecN 个（数据+奇偶）即可重建全部数据包 */
+  function tryDecodeBlock(b) {
+    if (blockDone[b]) return;
+    var count = blockInfo.dataCount(b);
+    var present = [];
+    for (var i = 0; i < count; i++) {
+      if (blockData[b][i]) {
+        var row = new Array(count).fill(0);
+        row[i] = 1;
+        present.push({ row: row, symbols: blockData[b][i] });
       }
     }
+    var rows = blockInfo.K ? QRProtocol.fecParityRows(count, blockInfo.K) : [];
+    for (var p = 0; p < blockInfo.K; p++) {
+      if (blockParity[b][p]) present.push({ row: rows[p], symbols: blockParity[b][p] });
+    }
+    if (present.length < count) return;
+    var recovered = QRProtocol.fecDecode(present, count);
+    if (!recovered) return;
+    blockDone[b] = 1;
+    var base = b * meta.fecN;
+    var gained = 0;
+    for (var i2 = 0; i2 < count; i2++) {
+      if (!chunks[base + i2]) {
+        chunks[base + i2] = recovered[i2];
+        gotCount++;
+        gained++;
+      }
+    }
+    blockData[b] = null;
+    blockParity[b] = null;   /* 释放内存 */
+    if (gained > 0) bumpSpeed(gained * meta.chunkSize);
+    if (gotCount === meta.chunks) finish();
+  }
+
+  function bumpSpeed(bytes) {
     var now = performance.now();
-    speedWindow.push({ t: now, b: pkt.payload.length });
+    speedWindow.push({ t: now, b: bytes });
     while (speedWindow.length && now - speedWindow[0].t > 5000) speedWindow.shift();
-    if (meta && gotCount === meta.chunks) finish();
   }
 
   function finish() {
@@ -13609,14 +13864,14 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
       $('progressText').textContent = QRProtocol.fmtBytes(gotB) + ' / ' + QRProtocol.fmtBytes(meta.size) +
         ' · ' + (pct * 100).toFixed(1) + '% · 解码 ' + stats.fps + ' FPS' + eta;
       setStatus('接收中：' + (meta.name || '') + '（' + QRProtocol.fmtBytes(meta.size) + '）');
-    } else if (!meta && gotCount > 0 && lastTotal > 0) {
+    } else if (!meta && preMetaCount > 0 && lastTotal > 0) {
       /* 元数据未到：用包头 total 估算进度 */
-      var p2 = Math.min(100, gotCount / lastTotal * 100);
+      var p2 = Math.min(100, preMetaCount / lastTotal * 100);
       $('progressWrap').style.display = 'block';
       $('progressFill').style.width = p2.toFixed(1) + '%';
-      $('progressText').textContent = '已接收 ' + gotCount + ' / ' + lastTotal + ' 包 · ' +
+      $('progressText').textContent = '已接收 ' + preMetaCount + ' / ' + lastTotal + ' 包 · ' +
         p2.toFixed(1) + '% · 解码 ' + stats.fps + ' FPS（等待文件信息…）';
-      setStatus('接收中：已锁定 ' + regions.length + ' 个码位（' + gotCount + '/' + lastTotal + ' 包）');
+      setStatus('接收中：已锁定 ' + regions.length + ' 个码位（' + preMetaCount + '/' + lastTotal + ' 包）');
     } else if (!meta) {
       $('progressWrap').style.display = 'none';
     }
@@ -13674,8 +13929,11 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
     var est = Sender.estimate();
     var tip = '';
     if (est) {
+      var n = Math.ceil(file.size / est.chunkSize);
+      var blocks = Math.ceil(n / QRProtocol.FEC_DEFAULT_N);
+      var K = Math.max(4, Math.min(50, Math.round(Math.min(QRProtocol.FEC_DEFAULT_N, n) * 0.2)));
       tip = '码阵 ' + est.cols + '×' + est.rows + '（QR v' + est.version + '）· 每包约 ' + QRProtocol.fmtBytes(est.chunkSize) +
-        ' · 共 ' + Math.ceil(file.size / est.chunkSize) + ' 包<br>' +
+        ' · 数据 ' + n + ' 包 + 纠删冗余 ' + (blocks * K) + ' 包<br>' +
         '按典型效率估算：约 ' + QRProtocol.fmtTime(est.seconds) + '（实际取决于光线与手机性能）';
     }
     $('fileInfo').innerHTML = '<b>' + QRProtocol.esc(file.name) + '</b><br>' +
@@ -13707,9 +13965,23 @@ function findAlignmentPattern(matrix, alignmentPatternQuads, topRight, topLeft, 
   $('fileInput').addEventListener('change', function (e) {
     if (e.target.files && e.target.files[0]) onFile(e.target.files[0]);
   });
-  $('speedSel').addEventListener('change', syncConfig);
+  $('speedSel').addEventListener('change', function () {
+    syncConfig();
+    /* 切换档位时，帧间隔恢复该档默认值 */
+    $('intervalSlider').value = Sender.presetInterval($('speedSel').value);
+    refreshInterval();
+  });
   $('colorSyncChk').addEventListener('change', syncConfig);
   $('fullscreenChk').addEventListener('change', syncConfig);
+
+  /* 自定义帧间隔（100~1000ms，可覆盖档位默认） */
+  function refreshInterval() {
+    var ms = parseInt($('intervalSlider').value, 10);
+    Sender.setInterval(ms);
+    $('intervalVal').textContent = ms + 'ms（' + (1000 / ms).toFixed(1) + ' 帧/秒）';
+  }
+  $('intervalSlider').addEventListener('input', refreshInterval);
+  refreshInterval();
 
   /* ---------- 发送控制 ---------- */
   $('btnStart').addEventListener('click', function () {
