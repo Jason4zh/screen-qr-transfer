@@ -1,6 +1,9 @@
-/* 接收端全链路仿真：发送端真实帧序列（含彩色边框/洗牌/元数据插入）→ 位图渲染，
- * 接收端算法：整帧 jsQR 找种子 → 推导 3×2 网格 → 候选紧裁剪解码 → 区域跟踪 →
- * 包收集 → 重组校验。含噪点与随机丢码位，验证丢帧恢复能力。 */
+/* 接收端全链路仿真（协议 v2）：
+ * - 发送端行为：cell 字节按槽位改写、洗牌、元数据填充空槽位/每 12 帧插槽 0
+ * - 接收端行为：整帧种子 → 候选扫描收集「码位↔位置」对应 → 仿射拟合 →
+ *               逐格验证锁定 → 区域跟踪解码 → 包收集 → 重组校验
+ * - 场景：正对屏幕、3% 透视畸变、小文件（空槽位由元数据填充）
+ */
 'use strict';
 const qrcode = require('../lib/qrcode.js');
 const jsQR = require('../lib/jsqr.js');
@@ -25,9 +28,15 @@ function makeQr(bytes) {
   qr.make();
   return qr;
 }
+/* 发送端：克隆包并改写 cell 字节（byte[3]=槽位） */
+function patchCell(pkt, slot) {
+  const q = new Uint8Array(pkt);
+  q[3] = slot;
+  return q;
+}
 
-/* 发送端渲染：彩色边框 + 白色区域 + 3×2 网格（与 sender.js 同公式） */
-function renderFrame(payloads, W, H, frameNo, L) {
+/* 发送端渲染：整数模块像素（px）+ 统一绘制尺寸（所有包同版本） */
+function renderFrame(payloads, W, H, frameNo, L, px) {
   const data = new Uint8ClampedArray(W * H * 4);
   const bg = PALETTE[frameNo % 4];
   for (let i = 0; i < data.length; i += 4) { data[i] = bg[0]; data[i + 1] = bg[1]; data[i + 2] = bg[2]; data[i + 3] = 255; }
@@ -35,18 +44,19 @@ function renderFrame(payloads, W, H, frameNo, L) {
   for (let y = m; y < m + H - 2 * m; y++) for (let x = m; x < m + W - 2 * m; x++) {
     const o = (y * W + x) * 4; data[o] = data[o + 1] = data[o + 2] = 255;
   }
+  const quiet = 4;
   for (let r = 0; r < 2; r++) for (let c = 0; c < 3; c++) {
     const p = payloads[r * 3 + c];
     if (p == null) continue;
     const cell = L.cells[r * 3 + c];
     const qr = makeQr(p), mods = qr.getModuleCount();
-    const scale = L.qrSize / (mods + 8);
-    const x0 = Math.round(cell.x - L.qrSize / 2), y0 = Math.round(cell.y - L.qrSize / 2);
+    const qrDrawn = px * (mods + 8);       /* 整数模块像素 → 模块均匀 */
+    const x0 = Math.round(cell.x - qrDrawn / 2), y0 = Math.round(cell.y - qrDrawn / 2);
     for (let mm = 0; mm < mods; mm++) for (let nn = 0; nn < mods; nn++) {
       if (qr.isDark(mm, nn)) {
-        const X0 = x0 + Math.round((nn + 4) * scale), Y0 = y0 + Math.round((mm + 4) * scale);
-        const X1 = x0 + Math.round((nn + 5) * scale), Y1 = y0 + Math.round((mm + 5) * scale);
-        for (let Y = Y0; Y < Y1; Y++) for (let X = X0; X < X1; X++) {
+        const X0 = x0 + (nn + quiet) * px, Y0 = y0 + (mm + quiet) * px;
+        for (let dy = 0; dy < px; dy++) for (let dx = 0; dx < px; dx++) {
+          const X = X0 + dx, Y = Y0 + dy;
           if (X < 0 || Y < 0 || X >= W || Y >= H) continue;
           const o = (Y * W + X) * 4; data[o] = data[o + 1] = data[o + 2] = 0;
         }
@@ -54,6 +64,23 @@ function renderFrame(payloads, W, H, frameNo, L) {
     }
   }
   return { data, width: W, height: H };
+}
+
+/* 透视变形：四边形映射（模拟手机斜对屏幕），白底 */
+function warp(src, sw, sh, dstW, dstH, corners) {
+  const out = new Uint8ClampedArray(dstW * dstH * 4);
+  for (let i = 0; i < out.length; i += 4) { out[i] = 255; out[i + 1] = 255; out[i + 2] = 255; out[i + 3] = 255; }
+  const [tl, tr, br, bl] = corners;
+  for (let y = 0; y < dstH; y++) for (let x = 0; x < dstW; x++) {
+    const ux = x / dstW, uy = y / dstH;
+    const topX = tl[0] + (tr[0] - tl[0]) * ux, topY = tl[1] + (tr[1] - tl[1]) * ux;
+    const botX = bl[0] + (br[0] - bl[0]) * ux, botY = bl[1] + (br[1] - bl[1]) * ux;
+    const px = topX + (botX - topX) * uy, py = topY + (botY - topY) * uy;
+    const sx = Math.min(sw - 1, Math.max(0, Math.round(px))), sy = Math.min(sh - 1, Math.max(0, Math.round(py)));
+    const so = (sy * sw + sx) * 4, do_ = (y * dstW + x) * 4;
+    out[do_] = src[so]; out[do_ + 1] = src[so + 1]; out[do_ + 2] = src[so + 2]; out[do_ + 3] = 255;
+  }
+  return { data: out, width: dstW, height: dstH };
 }
 
 function crop(img, x, y, w, h) {
@@ -74,18 +101,79 @@ function addNoise(img, pct) {
   }
 }
 
-/* ---------- 测试主体 ---------- */
-console.log('== 流式多帧传输仿真（噪点 + 随机丢码位 + 周期性重新定位） ==');
-{
-  const fileBytes = new Uint8Array(25000);
-  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 131 + 9) & 255;
-  const chunkSize = 404;
-  const { packets, meta } = Proto.packetize(fileBytes, 'stream-sim.bin', chunkSize);
-  const W = 1280, H = 853;
-  const L = Proto.gridLayout(W, H);
-  ok(L.qrSize > 250 && L.gap >= 40, `布局合理 qrSize=${L.qrSize} gap=${L.gap}（jsQR 多码可检测的间距）`);
+function median(arr) {
+  if (!arr.length) return 0;
+  const a = arr.slice().sort((x, y) => x - y);
+  return a[Math.floor(a.length / 2)];
+}
 
-  /* 发送端行为：洗牌窗口 + 每 24 帧在槽 0 插入元数据 */
+/* 接收端定位（与 receiver.js 同算法）：返回区域列表 */
+function locate(img, handlePkt) {
+  const W = img.width, H = img.height;
+  const seed = jsQR(img.data, W, H);
+  if (!seed) return [];
+  const corr = [], sizes = [];
+  function addCorr(qr, ox, oy) {
+    const pkt = Proto.decodePacket(qr.binaryData);
+    if (!pkt) return;
+    const dg = Proto.deriveGrid(qr);
+    corr.push({ cell: pkt.cell, x: dg.centerX + ox, y: dg.centerY + oy, size: dg.qrSize });
+    sizes.push(dg.qrSize);
+    if (handlePkt) handlePkt(pkt);
+  }
+  addCorr(seed, 0, 0);
+  const g = Proto.deriveGrid(seed);
+  const half = g.qrSize / 2 + 4;
+  const side = Math.round(g.qrSize + 8);
+  for (const [dx, dy] of Proto.candidateOffsets()) {
+    const cx = g.centerX + dx * g.pitch, cy = g.centerY + dy * g.pitch;
+    if (cx - half < 0 || cy - half < 0 || cx + half > W || cy + half > H) continue;
+    const rx = Math.round(cx - half), ry = Math.round(cy - half);
+    const t = crop(img, rx, ry, side, side);
+    const r = jsQR(t.data, t.width, t.height);
+    if (r && r.binaryData) addCorr(r, rx, ry);
+  }
+  const medSize = median(sizes) || g.qrSize;
+  const T = corr.length >= 3 ? Proto.fitAffine(corr) : null;
+  const found = [];
+  if (T) {
+    const cside = Math.round(medSize + 8);
+    const chalf = medSize / 2 + 4;
+    for (let cellId = 0; cellId < 6; cellId++) {
+      const pos = T.apply(cellId);
+      if (pos.x - chalf < 0 || pos.y - chalf < 0 || pos.x + chalf > W || pos.y + chalf > H) continue;
+      const rx = Math.round(pos.x - chalf), ry = Math.round(pos.y - chalf);
+      const t2 = crop(img, rx, ry, cside, cside);
+      const r2 = jsQR(t2.data, t2.width, t2.height);
+      if (r2 && r2.binaryData) {
+        const pkt2 = Proto.decodePacket(r2.binaryData);
+        if (pkt2 && pkt2.cell === cellId) {
+          found.push({ cell: cellId, x: rx, y: ry, w: cside, h: cside });
+          if (handlePkt) handlePkt(pkt2);
+        }
+      }
+    }
+  } else {
+    const seen = {};
+    for (const c of corr) {
+      if (seen[c.cell]) continue;
+      seen[c.cell] = true;
+      const h2 = c.size / 2 + 4;
+      found.push({ cell: c.cell, x: Math.round(c.x - h2), y: Math.round(c.y - h2), w: Math.round(c.size + 8), h: Math.round(c.size + 8) });
+    }
+  }
+  return found;
+}
+
+/* 传输会话：布局与分块统一由 computeLayoutParams 决定（与 sender.js 一致） */
+function session(fileBytes, opts) {
+  const W = 1280, H = 853;
+  const P = Proto.computeLayoutParams(W, H, opts.maxVersion || 17);
+  const L = Proto.gridLayout(W, H, P.qrDrawn);
+  const px = P.px;
+  const chunkSize = P.chunkSize;
+  const { packets, meta } = Proto.packetize(fileBytes, 'sim.bin', chunkSize);
+
   const order = [];
   for (let i = 1; i <= meta.chunks; i++) order.push(i);
   let pos = 0;
@@ -96,100 +184,98 @@ console.log('== 流式多帧传输仿真（噪点 + 随机丢码位 + 周期性�
 
   const chunks = new Array(meta.chunks);
   const received = new Uint8Array(meta.chunks + 1);
-  let got = 0, frames = 0, relocates = 0, metaSeen = false;
-  let regions = [];
+  let got = 0, frames = 0, metaSeen = false, regions = [];
+  const handlePkt = (pkt) => {
+    if (pkt.isMeta) { metaSeen = true; return; }
+    if (pkt.index >= 1 && pkt.index <= meta.chunks && !received[pkt.index]) {
+      received[pkt.index] = 1; got++;
+      chunks[pkt.index - 1] = pkt.payload;
+    }
+  };
 
-  for (frames = 0; frames < 300 && got < meta.chunks; frames++) {
-    /* 构造本帧槽位 */
+  const maxFrames = opts.maxFrames || 300;
+  for (frames = 0; frames < maxFrames && (got < meta.chunks || !metaSeen); frames++) {
+    /* 槽位（与 sender.js 一致）：槽位 0 固定元数据；队列耗尽重建；
+     * 小文件剩余槽位填元数据 */
     const slots = new Array(6).fill(null);
-    if (frames % 24 === 0) slots[0] = 0;
+    slots[0] = 0;
     for (let i = 0; i < 6; i++) {
       if (slots[i] !== null) continue;
-      if (pos >= order.length) reshuffle();
-      slots[i] = order[pos++];
+      if (order.length === 0 || pos >= meta.chunks) reshuffle();
+      if (pos < meta.chunks) { slots[i] = order[pos++]; }
+      else { slots[i] = 0; }
     }
-    /* 随机丢一个码位（模拟某区域连续失败） */
+    /* 随机丢一个码位（模拟某区域失败） */
     const dropCell = (Math.random() * 6) | 0;
-    const payloads = slots.map((ix, cell) => (cell === dropCell || ix == null) ? null : packets[ix]);
-    const img = renderFrame(payloads, W, H, frames % 4, L);
+    const payloads = slots.map((ix, cell) => (cell === dropCell || ix == null) ? null : patchCell(packets[ix], cell));
+    let img = renderFrame(payloads, W, H, frames % 4, L, px);
+    if (opts.warp) img = warp(img.data, W, H, opts.warp.dstW, opts.warp.dstH, opts.warp.corners);
     addNoise(img, 0.002);
 
-    /* 接收端：周期性重新定位（每 25 帧一次） */
-    if (frames % 25 === 0 || frames === 0) {
-      relocates++;
-      const seed = jsQR(img.data, W, H);
-      if (seed) {
-        const g = Proto.deriveGrid(seed);
-        const found = [];
-        for (const [dx, dy] of Proto.candidateOffsets()) {
-          const cx = g.centerX + dx * g.pitch, cy = g.centerY + dy * g.pitch;
-          const half = g.qrSize / 2 + 4, side = Math.round(g.qrSize + 8);
-          if (cx - half < 0 || cy - half < 0 || cx + half > W || cy + half > H) continue;
-          const t = crop(img, Math.round(cx - half), Math.round(cy - half), side, side);
-          const r = jsQR(t.data, t.width, t.height);
-          if (r && r.binaryData) {
-            const pkt = Proto.decodePacket(r.binaryData);
-            if (pkt) found.push({ x: Math.round(cx - half), y: Math.round(cy - half), w: side, h: side, fails: 0, ok: 1 });
-          }
-        }
-        if (found.length) regions = found;
-      }
+    if (frames % 10 === 0 || frames === 0) {
+      regions = locate(img, handlePkt);
     }
-    /* 区域跟踪解码 */
     for (const rg of regions) {
       const t = crop(img, rg.x, rg.y, rg.w, rg.h);
       const qr = jsQR(t.data, t.width, t.height);
       if (!qr) continue;
       const pkt = Proto.decodePacket(qr.binaryData);
       if (!pkt) continue;
-      if (pkt.isMeta) { metaSeen = true; continue; }
-      if (pkt.index >= 1 && pkt.index <= meta.chunks && !received[pkt.index]) {
-        received[pkt.index] = 1; got++;
-        chunks[pkt.index - 1] = pkt.payload;
-      }
+      handlePkt(pkt);
     }
   }
-  ok(got === meta.chunks, `历经 ${frames} 帧收齐 ${meta.chunks} 个数据包（每帧噪点+随机丢码）`);
-  ok(metaSeen, '元数据包已收到');
-  const assembled = Proto.assemble(meta, chunks);
-  ok(assembled && Proto.crc32(assembled) === meta.crc32 &&
-     Buffer.compare(Buffer.from(assembled), Buffer.from(fileBytes)) === 0, '整文件 CRC 校验一致');
-  console.log(`  帧数=${frames}（理论最少 ${Math.ceil(meta.chunks / 5)}，重新定位 ${relocates} 次）`);
+  return { frames, got, metaSeen, chunks, meta, received, regions, fileBytes };
 }
 
-console.log('\n== 小文件（不足 6 包，含空槽位） ==');
+/* ---------- 测试主体 ---------- */
+console.log('== 场景 1：正对屏幕，常规文件（40KB） ==');
 {
-  const fileBytes = new Uint8Array(1000);
+  const fileBytes = new Uint8Array(40000);
+  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 131 + 9) & 255;
+  const r = session(fileBytes, { maxFrames: 300 });
+  ok(r.got === r.meta.chunks, `历经 ${r.frames} 帧收齐 ${r.meta.chunks} 包`);
+  ok(r.metaSeen, '元数据已收到');
+  const assembled = Proto.assemble(r.meta, r.chunks);
+  ok(assembled && Proto.crc32(assembled) === r.meta.crc32 &&
+     Buffer.compare(Buffer.from(assembled), Buffer.from(r.fileBytes)) === 0, '整文件 CRC 校验一致');
+}
+
+console.log('\n== 场景 2：正对屏幕，小文件（1.5KB，空槽位由元数据填充） ==');
+{
+  const fileBytes = new Uint8Array(1500);
   for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 53 + 7) & 255;
-  const { packets, meta } = Proto.packetize(fileBytes, 'small.bin', 404);
-  const W = 1280, H = 853;
-  const L = Proto.gridLayout(W, H);
-  let got = 0;
-  const chunks = new Array(meta.chunks);
-  for (let frames = 0; frames < 40 && got < meta.chunks; frames++) {
-    const slots = [0, 1, 2, 3, null, null];
-    const payloads = slots.map(ix => ix == null ? null : packets[ix]);
-    const img = renderFrame(payloads, W, H, frames % 4, L);
-    const seed = jsQR(img.data, W, H);
-    if (!seed) continue;
-    const g = Proto.deriveGrid(seed);
-    for (const [dx, dy] of Proto.candidateOffsets()) {
-      const cx = g.centerX + dx * g.pitch, cy = g.centerY + dy * g.pitch;
-      const half = g.qrSize / 2 + 4, side = Math.round(g.qrSize + 8);
-      if (cx - half < 0 || cy - half < 0 || cx + half > W || cy + half > H) continue;
-      const t = crop(img, Math.round(cx - half), Math.round(cy - half), side, side);
-      const r = jsQR(t.data, t.width, t.height);
-      if (r && r.binaryData) {
-        const pkt = Proto.decodePacket(r.binaryData);
-        if (pkt && pkt.index >= 1 && pkt.index <= meta.chunks && !chunks[pkt.index - 1]) {
-          chunks[pkt.index - 1] = pkt.payload; got++;
-        }
-      }
-    }
-  }
-  const assembled = Proto.assemble(meta, chunks);
-  ok(assembled && Proto.crc32(assembled) === meta.crc32 &&
-     Buffer.compare(Buffer.from(assembled), Buffer.from(fileBytes)) === 0, `小文件（3 包）传输成功`);
+  const r = session(fileBytes, { maxFrames: 60 });
+  console.log(`  码位锁定 ${r.regions.length}/6（空槽位已由元数据填充，部分锁定也可完成传输）`);
+  ok(r.got === r.meta.chunks, `历经 ${r.frames} 帧收齐 ${r.meta.chunks} 包`);
+  ok(r.metaSeen, '元数据已收到');
+  const assembled = Proto.assemble(r.meta, r.chunks);
+  ok(assembled && Proto.crc32(assembled) === r.meta.crc32 &&
+     Buffer.compare(Buffer.from(assembled), Buffer.from(r.fileBytes)) === 0, '整文件 CRC 校验一致');
+  console.log(`  帧数=${r.frames}（1.5KB 应数秒内完成）`);
+}
+
+console.log('\n== 场景 3：3% 透视畸变（模拟手机斜对屏幕） ==');
+{
+  const fileBytes = new Uint8Array(40000);
+  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 97 + 3) & 255;
+  const r = session(fileBytes, {
+    maxFrames: 300,
+    warp: { dstW: 1240, dstH: 840, corners: [[20, 30], [1220, 20], [1235, 810], [30, 830]] }
+  });
+  console.log(`  透视下码位锁定 ${r.regions.length}/6（部分锁定也能完成传输）`);
+  ok(r.got === r.meta.chunks, `透视下历经 ${r.frames} 帧收齐 ${r.meta.chunks} 包`);
+  const assembled = Proto.assemble(r.meta, r.chunks);
+  ok(assembled && Proto.crc32(assembled) === r.meta.crc32 &&
+     Buffer.compare(Buffer.from(assembled), Buffer.from(r.fileBytes)) === 0, '透视下整文件 CRC 校验一致');
+}
+
+console.log('\n== 场景 4：数据包头 total 支撑元数据前的进度估算 ==');
+{
+  const fileBytes = new Uint8Array(5000);
+  for (let i = 0; i < fileBytes.length; i++) fileBytes[i] = (i * 11 + 5) & 255;
+  const { packets } = Proto.packetize(fileBytes, 'p.bin', 404);
+  const d = Proto.decodePacket(packets[1]);
+  ok(d && d.total === Math.ceil(5000 / 404), `数据包头携带 total=${d.total}，元数据前即可估算进度`);
 }
 
 console.log(`\n结果：${passed} 通过, ${failed} 失败`);

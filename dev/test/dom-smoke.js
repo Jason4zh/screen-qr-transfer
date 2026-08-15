@@ -16,7 +16,7 @@ function makeCtx() {
     get(t, prop) {
       if (prop === 'measureText') return () => ({ width: 100 });
       if (prop === 'getImageData') return () => ({ data: new Uint8ClampedArray(4), width: 1, height: 1 });
-      return (...args) => { calls.push(String(prop)); };
+      return (...args) => { calls.push(String(prop) + (prop === 'fillRect' ? ':' + args.join(',') : '')); };
     },
     set() { return true; }
   });
@@ -125,7 +125,7 @@ ok(!!Sender && !!UI, 'Sender / UI 已暴露');
   const canvas = elements['txCanvas'];
   const drawCalls = canvas._calls;
   /* 主画布：背景 + 空单元 fillRect + 贴图 drawImage；模块像素画在离屏画布上 */
-  const offRects = createdCanvases.reduce((s, c) => s + c._calls.filter(x => x === 'fillRect').length, 0);
+  const offRects = createdCanvases.reduce((s, c) => s + c._calls.filter(x => x.startsWith('fillRect')).length, 0);
   ok(offRects > 3000, `离屏画布绘制了 ${offRects} 次 fillRect（QR 模块逐格绘制，v17≈7千格）`);
   ok(drawCalls.includes('drawImage'), 'drawImage 被调用（QR 贴图缩放）');
   ok(elements['txOverlay'].style.display === 'flex', '发送遮罩已显示');

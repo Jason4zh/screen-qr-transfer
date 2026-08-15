@@ -38,17 +38,16 @@
     };
   };
 
-  /* 依据当前屏幕像素尺寸计算实际码阵与分包大小（含降级：屏幕太小自动缩阵） */
+  /* 依据当前屏幕像素尺寸计算布局参数（整数模块像素、版本、绘制尺寸、分包大小） */
   function computeChunkSize(W, H) {
-    var L = QRProtocol.gridLayout(W, H);
-    var cols = QRProtocol.GRID_COLS, rows = QRProtocol.GRID_ROWS;
-    cfg.cols = cols; cfg.rows = rows;
-    var maxMods = Math.floor(L.qrSize / 3.5) - 8;       /* 每模块 ≥3.5 屏幕像素，另留静区 */
-    var verByPx = Math.max(1, Math.min(40, Math.floor((maxMods - 17) / 4)));
-    var ver = Math.max(1, Math.min(cfg.maxVersion, verByPx));
-    cfg.version = ver;
-    var cap = QRProtocol.CAPACITY_L[ver];
-    return Math.max(64, cap - QRProtocol.HEADER_LEN - 4);
+    var P = QRProtocol.computeLayoutParams(W, H, cfg.maxVersion);
+    cfg.cols = QRProtocol.GRID_COLS;
+    cfg.rows = QRProtocol.GRID_ROWS;
+    cfg.version = P.version;
+    cfg.px = P.px;
+    cfg.total = P.total;
+    cfg.qrDrawn = P.qrDrawn;
+    return P.chunkSize;
   }
 
   /* 供 UI 预估用 */
@@ -80,16 +79,20 @@
     order = shuffle(arr); pos = 0;
   }
 
-  /* 每帧挑选一窗口的包；每 24 帧把 0 号（元数据）插到槽位 0，保证接收端尽早拿到文件信息 */
+  /* 每帧槽位 0 固定为元数据包（可靠性优先：接收端只要锁住 0 号码位
+   * 就能立即拿到文件信息并显示进度）；
+   * 数据队列耗尽即重建（小文件也会循环重发全部数据包）；
+   * 小文件（数据包不足 6 个）时剩余槽位用元数据填充：所有码位都有内容 */
   function nextFramePacketIndexes() {
     var n = cfg.cols * cfg.rows;
     var out = new Array(n).fill(null);
-    if (meta && n > 0 && frameNo % 24 === 0) out[0] = 0;
+    if (meta && n > 0) out[0] = 0;
     for (var i = 0; i < n; i++) {
       if (out[i] !== null) continue;
       if (!meta || meta.chunks === 0) continue;
-      if (order.length === 0 || pos >= order.length) buildOrder();
-      out[i] = order[pos++];
+      if (order.length === 0 || pos >= meta.chunks) buildOrder();   /* 队列为空或耗尽：重建（重新洗牌）继续重发 */
+      if (pos < meta.chunks) { out[i] = order[pos++]; }
+      else { out[i] = 0; }                    /* 兜底：剩余槽位填元数据 */
     }
     slotsSent += n;
     return out;
@@ -109,8 +112,8 @@
 
   function render(payloads, fn) {
     var W = canvas.width, H = canvas.height;
-    var L = QRProtocol.gridLayout(W, H);
-    var qrSize = L.qrSize, m = L.m;
+    var L = QRProtocol.gridLayout(W, H, cfg.qrDrawn);
+    var qrDrawn = cfg.qrDrawn, m = L.m;
     /* 彩色边框（帧同步标识色） */
     ctx.fillStyle = cfg.colorSync ? PALETTE[fn % PALETTE.length] : '#20243a';
     ctx.fillRect(0, 0, W, H);
@@ -123,9 +126,13 @@
       for (var c = 0; c < cfg.cols; c++) {
         var p = payloads[r * cfg.cols + c];
         var cell = L.cells[r * cfg.cols + c];
-        var x = Math.round(cell.x - qrSize / 2), y = Math.round(cell.y - qrSize / 2);
+        var x = Math.round(cell.x - qrDrawn / 2), y = Math.round(cell.y - qrDrawn / 2);
         if (p == null) { continue; }
-        var qr = makeQrMatrix(p);
+        /* 克隆并改写 cell 字节（byte[3]=槽位），供接收端建立码位↔位置对应；
+         * 元数据包可能同时出现在多个槽位，必须克隆避免互相覆盖 */
+        var q = new Uint8Array(p);
+        q[3] = r * cfg.cols + c;
+        var qr = makeQrMatrix(q);
         var mods = qr.getModuleCount();
         var total = mods + quiet * 2;
         if (!off || off.width !== total) {
@@ -140,8 +147,9 @@
             if (qr.isDark(mm, nn)) offctx.fillRect(nn + quiet, mm + quiet, 1, 1);
           }
         }
-        ctx.imageSmoothingEnabled = true;
-        ctx.drawImage(off, x, y, qrSize, qrSize);
+        /* qrDrawn = 整数模块像素 × total → 缩放为精确整数倍，模块均匀锐利 */
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(off, x, y, qrDrawn, qrDrawn);
       }
     }
 
@@ -191,7 +199,8 @@
     var pass = 1;
     if (meta && meta.chunks > 0) pass = Math.floor(slotsSent / meta.chunks) + 1;
     var perFrame = QRProtocol.fmtBytes(chunkSize * cfg.cols * cfg.rows);
-    el.innerHTML = '已播 <b>' + shownFrames + '</b> 帧 · ' + fps.toFixed(1) + ' FPS · 第 ' + pass + ' 轮 · 单帧约 ' + perFrame;
+    el.innerHTML = '已播 <b>' + shownFrames + '</b> 帧 · ' + fps.toFixed(1) + ' FPS · 第 ' + pass + ' 轮 · 单帧约 ' + perFrame +
+      '<br><span class="dim">单向传输：手机端接收完成后，请点「⏹ 停止」</span>';
     var lbl = $('txLabel'); if (lbl) lbl.textContent = '📤 ' + (fileName.length > 20 ? fileName.slice(0, 20) + '…' : fileName) + ' · ' + QRProtocol.fmtBytes(fileBytes.length);
   }
 
@@ -243,6 +252,7 @@
   Sender.align = function () {
     ensureCanvas();
     if (running) return;
+    computeChunkSize(canvas.width, canvas.height);   /* 对齐测试使用与真实传输相同的布局 */
     alignMode = true; running = false;
     frameNo = 0; alignCache = null; shownFrames = 0;
     showOverlay(true);

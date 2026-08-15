@@ -101,6 +101,48 @@ for (const n of sizes) {
   ok(res && Buffer.compare(Buffer.from(res.binaryData), Buffer.from(bytes)) === 0, '往返 500×0xFF');
 }
 
+console.log('\n== 包编解码（含 cell 码位字段） ==');
+{
+  const payload = new Uint8Array([1, 2, 3, 4, 5]);
+  const p = Proto.encodePacket(7, 100, payload, false, 4);
+  const d = Proto.decodePacket(p);
+  ok(d && d.index === 7 && d.total === 100 && d.cell === 4 && !d.isMeta, '数据包 cell 字段往返');
+  const pm = Proto.encodePacket(0, 100, new TextEncoder().encode('{"v":1}'), true, 0);
+  const dm = Proto.decodePacket(pm);
+  ok(dm && dm.isMeta && dm.cell === 0, '元数据包 cell=0');
+  ok(Proto.HEADER_LEN === 18, '头部长度 18（含 cell 字节）');
+  const p2 = Uint8Array.from(p); p2[3] = 5;   /* 发送端按槽位改写 cell 字节（header 不参与 CRC） */
+  const d2 = Proto.decodePacket(p2);
+  ok(d2 && d2.cell === 5, 'cell 字节可被改写且仍可解码');
+}
+
+console.log('\n== 仿射拟合（码位→位置） ==');
+{
+  function model(cell) { return { u: cell % 3, v: Math.floor(cell / 3) }; }
+  function groundTruth(cell) {
+    const m = model(cell);
+    return { x: 100 + m.u * 220 + m.v * 30, y: 80 + m.u * 25 + m.v * 180 };
+  }
+  const corr = [];
+  for (let c = 0; c < 6; c++) {
+    const gt = groundTruth(c);
+    corr.push({ cell: c, x: gt.x + (Math.random() - 0.5) * 2, y: gt.y + (Math.random() - 0.5) * 2 });
+  }
+  const T = Proto.fitAffine(corr);
+  ok(!!T, '仿射拟合成功');
+  if (T) {
+    let maxErr = 0;
+    for (let c = 0; c < 6; c++) {
+      const p = T.apply(c);
+      const gt = groundTruth(c);
+      maxErr = Math.max(maxErr, Math.abs(p.x - gt.x), Math.abs(p.y - gt.y));
+    }
+    ok(maxErr < 3, `仿射拟合最大误差 ${maxErr.toFixed(2)}px（含 2px 噪声）`);
+  }
+  ok(Proto.fitAffine([{ cell: 0, x: 1, y: 1 }, { cell: 1, x: 2, y: 1 }]) === null, '对应点不足 3 个返回 null');
+  ok(Proto.fitAffine([{ cell: 0, x: 1, y: 1 }, { cell: 1, x: 2, y: 1 }, { cell: 2, x: 3, y: 1 }]) === null, '共线对应点返回 null（退化）');
+}
+
 console.log('\n== 分包 / 组包 / 丢包 / 篡改 ==');
 {
   const fileBytes = new Uint8Array(250000);
@@ -112,8 +154,10 @@ console.log('\n== 分包 / 组包 / 丢包 / 篡改 ==');
   const decoded = packets.map(p => Proto.decodePacket(p));
   ok(decoded.every(Boolean), '所有包可解码且 CRC 通过');
   ok(decoded[0].isMeta && decoded[0].index === 0, '首包为元数据包');
-  const m = JSON.parse(new TextDecoder().decode(decoded[0].payload));
-  ok(m.name === '测试文件.bin' && m.size === 250000 && m.chunks === expectN, '元数据解析正确');
+  /* 元数据已填充到 chunkSize：与数据包同长度 → 同版本 → 绘制尺寸统一 */
+  ok(decoded[0].payload.length === chunkSize, '元数据负载补齐到 chunkSize（同屏统一版本）');
+  const m = Proto.parseMetaPayload(decoded[0].payload);
+  ok(m.name === '测试文件.bin' && m.size === 250000 && m.chunks === expectN, '元数据解析正确（\0 截断）');
   /* 丢 5% 包（保留元数据）：缺包时应返回 null，等待后续轮次重传 */
   const kept = decoded.filter((d, i) => i === 0 || i % 20 !== 0);
   const chunksPartial = new Array(meta.chunks);
@@ -135,7 +179,30 @@ console.log('\n== 分包 / 组包 / 丢包 / 篡改 ==');
   const bad = Uint8Array.from(packets[5]); bad[20] ^= 0xFF;
   ok(Proto.decodePacket(bad) === null, '篡改包被 CRC 拒绝');
   ok(Proto.decodePacket(new Uint8Array(10)) === null, '过短数据被拒绝');
-  ok(Proto.decodePacket(Uint8Array.from([0x53, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 1, 2, 3, 4])) === null, 'CRC 错误包被拒绝');
+  ok(Proto.decodePacket(Uint8Array.from([0x53, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 4, 0, 0, 0, 0, 1, 2, 3, 4])) === null, 'CRC 错误包被拒绝');
+}
+
+console.log('\n== 布局参数（整数模块像素，模块均匀） ==');
+{
+  const P = Proto.computeLayoutParams(1280, 853, 17);
+  ok(P.px >= 3 && P.qrDrawn === P.px * P.total && P.total === P.version * 4 + 25,
+     `1280x853 平衡: px=${P.px} v${P.version} qrDrawn=${P.qrDrawn} chunk=${P.chunkSize}`);
+  const P2 = Proto.computeLayoutParams(1920, 1080, 17);
+  ok(P2.px >= 4 && P2.version === 17, `1920x1080 平衡: px=${P2.px} v${P2.version} qrDrawn=${P2.qrDrawn}`);
+  const P3 = Proto.computeLayoutParams(1920, 1080, 20);
+  ok(P3.version === 20 && P3.px >= 4, `1920x1080 高速: px=${P3.px} v${P3.version} qrDrawn=${P3.qrDrawn}`);
+  /* 布局适配检查：网格必须落在白色区域内 */
+  const L = Proto.gridLayout(1280, 853, P.qrDrawn);
+  const gridW = 3 * P.qrDrawn + 2 * L.gap, gridH = 2 * P.qrDrawn + L.gap;
+  ok(gridW <= 1280 - 2 * L.m && gridH <= 853 - 2 * L.m, `网格 ${gridW}x${gridH} ≤ 白色区域 ${1280 - 2 * L.m}x${853 - 2 * L.m}`);
+  /* 接收端推导与发送端布局一致：解码任意 QR 得到的尺寸 == qrDrawn */
+  const fileBytes = new Uint8Array(5000);
+  const { packets } = Proto.packetize(fileBytes, 'x.bin', P.chunkSize);
+  const qr = encodeQr(packets[1]);
+  const img = qrToImageData(qr, P.px);
+  const res = jsQR(img.data, img.width, img.height);
+  const dg = res ? Proto.deriveGrid(res) : null;
+  ok(dg && Math.abs(dg.qrSize - P.qrDrawn) < 2, `接收端推导尺寸 ${dg ? Math.round(dg.qrSize) : '-'} ≈ 发送端绘制 ${P.qrDrawn}`);
 }
 
 console.log('\n== v20 大负载数据包的 QR 往返 ==');
@@ -148,7 +215,7 @@ console.log('\n== v20 大负载数据包的 QR 往返 ==');
   const img = qrToImageData(qr, 5);
   const res = jsQR(img.data, img.width, img.height);
   const d = res ? Proto.decodePacket(res.binaryData) : null;
-  ok(d && d.index === 3 && Buffer.compare(Buffer.from(d.payload), Buffer.from(pkt.subarray(17))) === 0,
+  ok(d && d.index === 3 && Buffer.compare(Buffer.from(d.payload), Buffer.from(pkt.subarray(18))) === 0,
      `v20 数据包（838B 负载 @5px/模块）往返 + 包校验通过`);
 }
 
